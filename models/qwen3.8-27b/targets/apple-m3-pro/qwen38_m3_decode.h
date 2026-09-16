@@ -55,12 +55,23 @@ typedef struct {
     double first_chunk_ms;
 } qwen38_m3_prefill_result;
 
-/* Process a run of prompt tokens through batched S32/S16 graphs, falling
- * back to one-token forwards for a tail shorter than 16. Layer state after
- * prefill is bitwise-identical to the same tokens pushed one at a time; no
- * logits are produced, so the caller forwards the final prompt token through
- * qwen38_m3_model_forward for sampling. Synchronous; on error the layer
- * state is partially advanced and the caller should reset the model. */
+/* Process a run of prompt tokens through batched prefill graphs (128-row
+ * chunks by default, 512-row trunks with QWEN38_PREFILL_MAX_CHUNK=512 on the
+ * half-tile GEMM levels), falling back to one-token forwards for a tail
+ * shorter than 16. Layer state after prefill is bitwise-identical to the
+ * same tokens pushed one at a time (with QWEN38_KV_Q8=1 both paths write
+ * the same quantized KV vectors, so they stay comparable); no logits are
+ * produced, so the caller
+ * forwards the final prompt token through qwen38_m3_model_forward for
+ * sampling. With QWEN38_PREFILL_PROGRESS=1 a line goes to stderr each time
+ * a quarter of the fill is crossed (25/50/75%) and on completion.
+ * QWEN38_FLASH_PREFILL=1 swaps the two-pass attention (materialized scores
+ * matrix + softmax/P.V) for a single-pass online-softmax kernel that never
+ * writes the scores matrix; its arithmetic order differs, so it is held to
+ * the token-parity standard rather than bitwise equality. Synchronous;
+ * on error the
+ * layer state is
+ * partially advanced and the caller should reset the model. */
 int qwen38_m3_model_prefill(
     qwen38_m3_model *model,
     const uint32_t *token_ids,
@@ -89,6 +100,10 @@ int qwen38_m3_model_forward_wait(
     size_t *logit_count,
     char *error_message,
     size_t error_message_capacity);
+
+/* This process's current physical memory footprint in bytes (the number
+ * Activity Monitor shows for the process). Cheap; valid at any time. */
+size_t qwen38_m3_model_footprint(qwen38_m3_model *model);
 
 /* Multi-token prediction (greedy speculative decoding).
  *

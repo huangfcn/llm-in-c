@@ -210,6 +210,164 @@ kernel void qwen38_attention_softmax_value_gate(
     output[output_index] = value * query_gate[output_index];
 }
 
+/* Q8_0 KV cache (QWEN38_KV_Q8): each 256-dim head vector is stored as
+ * 256 int8 values followed by one fp32 scale, so a vector occupies
+ * kAttentionKVQ8Stride bytes; the dequantized value is int8 * scale.
+ * The scale spans the whole dot-product dimension, so it factors out of
+ * the Q.K reduction and multiplies the P.V accumulation per position,
+ * which keeps the readers' structure identical to the fp16 path. */
+constant uint kAttentionKVQ8Stride = 260;
+
+kernel void qwen38_attention_prepare_key_value_q8(
+    device const float *projected [[buffer(0)]],
+    device const float *norm_weight [[buffer(1)]],
+    constant AttentionDecodeParameters &parameters [[buffer(2)]],
+    device char *key_cache [[buffer(3)]],
+    device char *value_cache [[buffer(4)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint3 group_id [[threadgroup_position_in_grid]]) {
+    threadgroup float values[256];
+    threadgroup float squared[256];
+    threadgroup float key_magnitudes[256];
+    threadgroup float value_magnitudes[256];
+    uint head = group_id.x;
+    float value = projected[kAttentionKOffset + head * 256 + tid];
+    values[tid] = value;
+    squared[tid] = value * value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128; stride != 0; stride >>= 1) {
+        if (tid < stride) squared[tid] += squared[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float normalized = value *
+        rsqrt(squared[0] / 256.0f + kAttentionRmsEpsilon) *
+        norm_weight[tid];
+    values[tid] = normalized;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint position = parameters.position;
+    float key = apply_rope_component(values, tid, position);
+    float raw_value = projected[kAttentionVOffset + head * 256 + tid];
+    /* Independent per-vector scales: each of K and V uses the full
+     * [-127, 127] code range against its own maximum. */
+    key_magnitudes[tid] = fabs(key);
+    value_magnitudes[tid] = fabs(raw_value);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128; stride != 0; stride >>= 1) {
+        if (tid < stride) {
+            key_magnitudes[tid] =
+                max(key_magnitudes[tid], key_magnitudes[tid + stride]);
+            value_magnitudes[tid] =
+                max(value_magnitudes[tid], value_magnitudes[tid + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    /* scale = max/127; a zero vector keeps scale 0 and all-zero codes. */
+    float key_scale = key_magnitudes[0] / 127.0f;
+    float value_scale = value_magnitudes[0] / 127.0f;
+    uint vector_index = (position * kAttentionKVHeads + head) *
+                        kAttentionKVQ8Stride;
+    device char *key_vector = key_cache + vector_index;
+    device char *value_vector = value_cache + vector_index;
+    int code = 0;
+    int value_code = 0;
+    if (key_scale > 0.0f)
+        code = max(-127, min(127, (int)rint(key / key_scale)));
+    if (value_scale > 0.0f)
+        value_code = max(-127, min(127,
+                                   (int)rint(raw_value / value_scale)));
+    key_vector[tid] = (char)code;
+    value_vector[tid] = (char)value_code;
+    if (tid == 0) {
+        *(device float *)(key_vector + 256) = key_scale;
+        *(device float *)(value_vector + 256) = value_scale;
+    }
+}
+
+kernel void qwen38_attention_scores_q8(
+    device const float *query [[buffer(0)]],
+    device const char *key_cache [[buffer(1)]],
+    constant AttentionDecodeParameters &parameters [[buffer(2)]],
+    device float *scores [[buffer(3)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup_index [[simdgroup_index_in_threadgroup]],
+    uint simdgroups_per_group [[simdgroups_per_threadgroup]],
+    uint3 group_id [[threadgroup_position_in_grid]]) {
+    uint flat = group_id.x * simdgroups_per_group + simdgroup_index;
+    uint score_count = kAttentionQHeads * parameters.context_length;
+    if (flat >= score_count) return;
+    uint q_head = flat / parameters.context_length;
+    uint position = flat - q_head * parameters.context_length;
+    uint kv_head = q_head / (kAttentionQHeads / kAttentionKVHeads);
+    uint query_base = q_head * 256;
+    const device char *key_vector = key_cache +
+        ((position * kAttentionKVHeads + kv_head) * kAttentionKVQ8Stride);
+    float scale = *(const device float *)(key_vector + 256);
+    float partial = 0.0f;
+    for (uint index = lane; index < 256; index += 32) {
+        partial += query[query_base + index] *
+                   (float)(short)(key_vector[index]);
+    }
+    float score = simd_sum(partial) * scale * (1.0f / 16.0f);
+    if (lane == 0) {
+        scores[q_head * parameters.cache_capacity + position] = score;
+    }
+}
+
+kernel void qwen38_attention_softmax_value_gate_q8(
+    device const float *scores [[buffer(0)]],
+    device const char *value_cache [[buffer(1)]],
+    device const float *query_gate [[buffer(2)]],
+    constant AttentionDecodeParameters &parameters [[buffer(3)]],
+    device float *output [[buffer(4)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint3 group_id [[threadgroup_position_in_grid]]) {
+    threadgroup float reduction[256];
+    uint q_head = group_id.x;
+    uint score_base = q_head * parameters.cache_capacity;
+    float local_max = -INFINITY;
+    for (uint position = tid; position < parameters.context_length;
+         position += 256) {
+        local_max = max(local_max, scores[score_base + position]);
+    }
+    reduction[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128; stride != 0; stride >>= 1) {
+        if (tid < stride) reduction[tid] =
+            max(reduction[tid], reduction[tid + stride]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float maximum = reduction[0];
+    /* The same threadgroup array carries the next reduction; every thread
+     * must finish reading the maximum before any thread overwrites slot 0. */
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float local_sum = 0.0f;
+    for (uint position = tid; position < parameters.context_length;
+         position += 256) {
+        local_sum += exp(scores[score_base + position] - maximum);
+    }
+    reduction[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128; stride != 0; stride >>= 1) {
+        if (tid < stride) reduction[tid] += reduction[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float denominator = reduction[0];
+    uint kv_head = q_head / (kAttentionQHeads / kAttentionKVHeads);
+    float value = 0.0f;
+    for (uint position = 0; position < parameters.context_length;
+         ++position) {
+        const device char *vector = value_cache +
+            ((position * kAttentionKVHeads + kv_head) *
+             kAttentionKVQ8Stride);
+        float probability =
+            exp(scores[score_base + position] - maximum) / denominator;
+        value += probability * *(const device float *)(vector + 256) *
+               (float)(short)(vector[tid]);
+    }
+    uint output_index = q_head * 256 + tid;
+    output[output_index] = value * query_gate[output_index];
+}
+
 kernel void qwen38_q4_attention_output_residual(
     device const float *input [[buffer(0)]],
     device const uchar *quants [[buffer(1)]],

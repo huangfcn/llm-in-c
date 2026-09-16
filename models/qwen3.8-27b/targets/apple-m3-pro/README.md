@@ -232,6 +232,59 @@ generated afterwards. The runtime's own speed knobs - `QWEN38_MTP_DEPTH`,
 [`results.json`](results.json) measured as best, so the prompt is where the
 remaining speed is.
 
+`QWEN38_PIN_WEIGHTS` pins the mmap'd weight images in RAM (default: auto).
+The weights are file-backed page-cache pages, and the MTP verify stream - a
+full pass over every weight byte per accepted token - evicts most of the
+~15 GB between prefill chunks; each chunk then re-faults from the NVMe at a
+few GB/s, which is why prefill plateaus around 45 tok/s regardless of chunk
+shape. Pinning makes every chunk read at memory bandwidth instead, so long
+prefills should drop from minutes to single-digit seconds on machines where
+it engages. Auto mode pins only when physical RAM holds the weights plus
+this model's KV cache plus a 6 GB headroom for the OS, server and GPU working
+set (a 36 GB machine pins; an 18 GB one does not). `=1` forces it, `=0`
+disables it; if `mlock` is refused the forced mode falls back to reading the
+pages into the cache once at open (warmed, not pinned) and says so on stderr.
+
+`QWEN38_KV_Q8=1` stores the attention KV cache as Q8_0 instead of fp16
+(opt-in, unmeasured here). Each 256-dim head vector becomes 256 int8 codes
+plus one fp32 scale - 260 bytes instead of 512 - so the KV memory and its
+read traffic roughly halve: at a 65536 context the main model's cache drops
+from ~4.3 GB to ~2.2 GB, and the MTP layer's identical cache does the same,
+freeing ~4 GB in total. Quantization happens once at write (the decode and
+prefill writers share it, so both paths stay consistent); the readers
+dequantize inline, with the per-vector scale factored out of the Q.K dot
+product. K and V get independent scales, each using the full [-127, 127]
+code range against its own maximum - finer-grained than llama.cpp's 32-
+element q8_0 blocks. Expect at worst a small perplexity bump (Q8_0 KV is
+standard practice in llama.cpp's `--cache-type-k q8_0`); on this greedy
+temperature-0 runtime the risk is occasional token flips on long contexts,
+so compare one normal session against the fp16 default before relying on it.
+The MTP layer, prefix checkpoint mirrors and the reset path all follow the
+same layout automatically. Unset or `=0` keeps the byte-identical fp16 path.
+
+Three prefill knobs are opt-in and unmeasured here. `QWEN38_PREFILL_MAX_CHUNK=512`
+widens the default 128-row chunks to 512-row trunks (half-tile GEMM levels
+only): a full pass streams every mapped weight byte, so four times as many
+tokens per stream should amortize better on long prompts; the trunk runs on
+its own lazily allocated workspace whose scores buffer is 4x the 128-row one
+and grows with the context capacity (about 3 GB at 128k), and its MTP
+draft-cache refresh runs on that same workspace. `QWEN38_FLASH_PREFILL=1`
+replaces the two-pass prefill attention (materialize the full batch x
+context scores matrix, then a separate softmax + P.V pass over it) with a
+single-pass flash-attention kernel: one threadgroup per (row, q-head)
+streams the KV cache in 24-position blocks with an online softmax, so the
+scores matrix is never written to or re-read from device memory and the
+attention cost of a chunk stops growing super-linearly with the context
+length. It follows `QWEN38_KV_Q8` automatically (a Q8 variant dequantizes
+K/V inline) and applies to both the prompt chunks and the MTP verify
+replay. The arithmetic order differs from the two-pass path, so it is
+gated by the same token-parity standard as the MMA GEMMs - run one normal
+session against the default before relying on it. `QWEN38_PREFILL_PROGRESS=1`
+prints one line to stderr each time a quarter of the fill is crossed
+(25/50/75%) plus a final 100% line - at most four lines per prefill, with
+the running percentage and tok/s - so a long silent prefill can be
+followed from the terminal.
+
 `QWEN38_STRIP_BLOCKS` drops named `<block>...</block>` spans from Codex's
 context messages before rendering. It defaults to `recommended_plugins`, a
 1,842-token list of plugins that are neither installed nor enabled in this

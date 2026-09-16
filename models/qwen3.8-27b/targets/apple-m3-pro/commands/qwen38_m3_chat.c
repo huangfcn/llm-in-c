@@ -35,6 +35,41 @@ static uint32_t parse_u32(const char *text, uint32_t fallback) {
     return end != text && *end == '\0' ? (uint32_t)value : fallback;
 }
 
+/* QWEN38_DEBUG_TOKENS=1: dump the chosen token and its top-5 logits to
+ * stderr for every generated position. Running the same prompt with two
+ * prefill variants (flash on/off, MTP off, greedy) and diffing these lines
+ * shows exactly where the two states first diverge. Read-only: it never
+ * touches the logits buffer. */
+static void debug_dump_logits(const char *label, uint32_t token,
+                              const float *logits, size_t count) {
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = getenv("QWEN38_DEBUG_TOKENS") != NULL &&
+                  getenv("QWEN38_DEBUG_TOKENS")[0] != '0';
+    if (!enabled || logits == NULL || count == 0) return;
+    const size_t top = count < 5 ? count : 5;
+    uint32_t picked[5];
+    for (size_t i = 0; i < top; ++i) picked[i] = 0xFFFFFFFFu;
+    fprintf(stderr, "[dbg %s] token=%u top:", label, token);
+    for (size_t i = 0; i < top; ++i) {
+        uint32_t best = 0;
+        float best_value = logits[0];
+        for (size_t j = 0; j < count; ++j) {
+            int excluded = 0;
+            for (size_t k = 0; k < i; ++k)
+                if ((uint32_t)j == picked[k]) { excluded = 1; break; }
+            if (excluded) continue;
+            if (logits[j] > best_value) {
+                best_value = logits[j];
+                best = (uint32_t)j;
+            }
+        }
+        picked[i] = best;
+        fprintf(stderr, " %u:%.3f", best, best_value);
+    }
+    fprintf(stderr, "\n");
+}
+
 static char *trim_prompt(const char *prompt) {
     const uint8_t *bytes = (const uint8_t *)prompt;
     int32_t length = (int32_t)strlen(prompt);
@@ -738,6 +773,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "sampling failed\n");
                 failed = 1;
             }
+            debug_dump_logits("gen0", pending, logits, sample_count);
             uint32_t mtp_position = (uint32_t)prompt_count;
             int done = failed;
             while (!done) {
@@ -763,6 +799,17 @@ int main(int argc, char **argv) {
                 }
                 ++mtp_steps;
                 mtp_accepts += (size_t)step_accepted;
+                {
+                    int dbg_enabled = getenv("QWEN38_DEBUG_TOKENS") != NULL &&
+                                      getenv("QWEN38_DEBUG_TOKENS")[0] != '0';
+                    if (dbg_enabled) {
+                        fprintf(stderr, "[dbg mtp] step=%zu accepted=%d:",
+                                mtp_steps, step_accepted);
+                        for (uint32_t i = 0; i < step_count; ++i)
+                            fprintf(stderr, " %u", step_emitted[i]);
+                        fputc('\n', stderr);
+                    }
+                }
                 for (uint32_t i = 0; i < step_count; ++i)
                     if (history_count < capacity)
                         history[history_count++] = step_emitted[i];
@@ -806,6 +853,7 @@ int main(int argc, char **argv) {
                 failed = 1;
                 break;
             }
+            debug_dump_logits("gen", token, logits, sample_count);
             generated[generated_count++] = token;
             if (token == QWEN38_END_OF_TEXT || token == QWEN38_IM_END)
                 break;
@@ -855,7 +903,7 @@ int main(int argc, char **argv) {
                        "\"mtp_accepted\": %zu, \"mtp_depth\": %d, "
                        "\"prefilled_from\": %u, \"restore_s\": %.3f, "
                        "\"prefill_s\": %.3f, \"forward_s\": %.3f, "
-                       "\"save_s\": %.3f}\n",
+                       "\"save_s\": %.3f, \"footprint_gb\": %.2f}\n",
                        visible_count, prompt_count,
                        first_token_seconds >= 0.0 ?
                            first_token_seconds : 0.0,
@@ -863,7 +911,9 @@ int main(int argc, char **argv) {
                        stopped ? "stop" : "length",
                        mtp_steps, mtp_accepts, mtp_depth,
                        start_position, stage_restore, stage_prefill,
-                       stage_forward, stage_save);
+                       stage_forward, stage_save,
+                       (double)qwen38_m3_model_footprint(model) /
+                           (1024.0 * 1024.0 * 1024.0));
             }
             fflush(stdout);
         } else {

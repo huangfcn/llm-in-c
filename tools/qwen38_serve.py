@@ -55,9 +55,11 @@ REASONING_EFFORT_TEXT = {
 
 
 def message_text(message):
-    content = message.get("content", "")
+    content = message.get("content")
+    if content is None:
+        return ""
     if isinstance(content, list):
-        content = "".join(part.get("text", "") for part in content
+        content = "".join(part.get("text") or "" for part in content
                           if isinstance(part, dict))
     return content
 
@@ -1125,16 +1127,16 @@ def main():
     parser.add_argument("--tokenizer")
     parser.add_argument("--context", type=int,
                         default=int(os.environ.get("QWEN38_CONTEXT",
-                                                   4096)))
+                                                   65536)))
     parser.add_argument("--max-tokens", type=int,
                         default=int(os.environ.get("QWEN38_MAX_TOKENS",
-                                                   3072)))
+                                                   16384)))
     parser.add_argument("--thinking", action="store_true",
                         default=os.environ.get("QWEN38_THINKING",
                                                "") not in ("", "0"))
     parser.add_argument("--reasoning-effort",
                         default=os.environ.get("QWEN38_REASONING_EFFORT",
-                                               "xhigh"),
+                                               "low"),
                         choices=["low", "medium", "xhigh"])
     parser.add_argument("--temperature", type=float,
                         default=float(os.environ.get("QWEN38_TEMPERATURE",
