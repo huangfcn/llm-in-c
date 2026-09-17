@@ -53,11 +53,18 @@ make qwen38-m3-chat qwen38-tools qwen38-mtp-pack
 Download the exact revisions listed on the [model page](../../README.md), then compile the three weight shards and tokenizer:
 
 ```sh
+python compiler/qwen3.8-27b/apple-m3-pro/qwen38_q8_delta_quantize_all.py \
+    /path/to/qwen38-bf16/model.safetensors.index.json \
+    ./tmp/q8_all
+
 compiler/qwen3.8-27b/apple-m3-pro/qwen38_compile_runtime_images.sh \
   model-00001-of-00003.safetensors \
   model-00002-of-00003.safetensors \
   model-00003-of-00003.safetensors \
-  tokenizer.json /path/to/qwen38-runtime
+  tokenizer.json \
+  /path/to/qwen38-runtime ./tmp/q8_all
+
+rm -fr ./tmp/q8_all
 ```
 
 Pack the standalone MTP checkpoint into the same directory:
