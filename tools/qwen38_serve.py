@@ -753,22 +753,28 @@ class Handler(BaseHTTPRequestHandler):
             self.plain_completion(rendered, identifier, created, sampling,
                                   thinking, table, system_turn)
 
-    def log_turn(self, api, tool_count, stats, calls):
+    def log_turn(self, api, tool_count, stats, calls, mtp=False):
+        # Same style as the "prefill progress" lines: right-aligned
+        # fixed-width columns so turns stack vertically in the log.
         prompt_tokens = stats.get("prompt_tokens", 0)
         reused = stats.get("prefilled_from", 0)
         generated = stats.get("tokens", 0)
         total = stats.get("total_s", 0.0) or 0.0
         first = stats.get("first_token_s", 0.0) or 0.0
         rate = generated / (total - first) if total > first else 0.0
-        print(f"{api}: {tool_count} tools, {prompt_tokens} prompt tokens "
-              f"({reused} reused), {first:.1f} s to first token, "
-              f"{generated} generated at {rate:.1f} tok/s, "
+        label = f"{api} turn:"
+        print(f"{label:<17}{generated:>7}/{prompt_tokens:>6} tokens "
+              f"({reused / prompt_tokens:.2f}, {first:>8.1f} s, "
+              f"{rate:>6.1f} tok/s), {tool_count} tools, "
               f"calls={calls or 'none'}", flush=True)
-        print(f"           ttft breakdown: restore "
-              f"{stats.get('restore_s', 0.0):.2f} s, prefill "
-              f"{stats.get('prefill_s', 0.0):.2f} s, forward "
-              f"{stats.get('forward_s', 0.0):.2f} s, checkpoint save "
-              f"{stats.get('save_s', 0.0):.2f} s", flush=True)
+        print(f"{'ttft breakdown:':<17}restore "
+              f"{stats.get('restore_s', 0.0):>8.2f} s, prefill "
+              f"{stats.get('prefill_s', 0.0):>8.2f} s, forward "
+              f"{stats.get('forward_s', 0.0):>8.2f} s, checkpoint save "
+              f"{stats.get('save_s', 0.0):>8.2f} s"
+              + (f", mtp {stats.get('mtp_accepted', 0)} accepted over "
+                 f"{stats.get('mtp_steps', 0)} steps" if mtp else ""),
+              flush=True)
 
     # --- Responses API ---------------------------------------------
 
@@ -942,26 +948,10 @@ class Handler(BaseHTTPRequestHandler):
             output = self.responses_output("".join(answer), table, identifier)
             calls = [item["name"] for item in output
                      if item["type"] == "function_call"]
-            prompt_tokens = stats.get("prompt_tokens", 0)
-            reused = stats.get("prefilled_from", 0)
-            generated = stats.get("tokens", 0)
-            total = stats.get("total_s", 0.0) or 0.0
-            first = stats.get("first_token_s", 0.0) or 0.0
-            rate = generated / (total - first) if total > first else 0.0
-            if not reused:
+            if not stats.get("prefilled_from", 0):
                 print(f"responses: cold turn exposes {len(table)} tools: "
                       f"{', '.join(table)}", flush=True)
-            print(f"responses: {len(table)} tools, {prompt_tokens} prompt "
-                  f"tokens ({reused} reused), {first:.1f} s to first token, "
-                  f"{generated} generated at {rate:.1f} tok/s, "
-                  f"calls={calls or 'none'}", flush=True)
-            print(f"           ttft breakdown: restore "
-                  f"{stats.get('restore_s', 0.0):.2f} s, prefill "
-                  f"{stats.get('prefill_s', 0.0):.2f} s, forward "
-                  f"{stats.get('forward_s', 0.0):.2f} s, checkpoint save "
-                  f"{stats.get('save_s', 0.0):.2f} s; mtp "
-                  f"{stats.get('mtp_accepted', 0)} accepted over "
-                  f"{stats.get('mtp_steps', 0)} steps", flush=True)
+            self.log_turn("responses", len(table), stats, calls, mtp=True)
             for index, item in enumerate(output):
                 self.sse_event("response.output_item.done",
                                {"output_index": index, "item": item})
@@ -1030,6 +1020,9 @@ class Handler(BaseHTTPRequestHandler):
     def stream_completion(self, rendered, identifier, created,
                           include_usage, sampling=None, thinking=False,
                           table=None, prefix=None):
+        if not prefix:
+            print(f"chat: cold turn exposes {len(table or {})} tools: "
+                  f"{', '.join(table or {})}", flush=True)
         # The SSE body carries no Content-Length, so it must use chunked
         # transfer encoding: without the 0-length terminator a keep-alive
         # client never sees the body end and its UI stays in the waiting
