@@ -761,7 +761,11 @@ class Handler(BaseHTTPRequestHandler):
     _TURN_COLS = (("prompt", "{:>6}"), ("reused", "{:>6}"),
                   ("ttft(s)", "{:>7.1f}"), ("rate(t/s)", "{:>9.1f}"),
                   ("tools", "{:>5}"))
-    _last_line_turn = False
+    # Head suppression: a turn row printed within this many seconds of
+    # the previous one is back-to-back and shares its head; anything
+    # older (a new chat after prefill/HTTP lines) reprints it.
+    _TURN_HEAD_GAP_S = 1.0
+    _last_turn_at = 0.0
 
     @classmethod
     def _turn_col_ends(cls):
@@ -782,8 +786,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_turn(self, api, tool_count, stats, calls, mtp=False):
         # Two-line table: head line, then the value row. The head is
-        # only printed when the previous line was not a turn row, so
-        # back-to-back chats share a single head.
+        # only printed when the previous turn row is older than
+        # _TURN_HEAD_GAP_S, so back-to-back chats share a single head
+        # while separated chats each get one.
         prompt_tokens = stats.get("prompt_tokens", 0)
         reused = stats.get("prefilled_from", 0)
         generated = stats.get("tokens", 0)
@@ -791,7 +796,8 @@ class Handler(BaseHTTPRequestHandler):
         first = stats.get("first_token_s", 0.0) or 0.0
         rate = min(generated / (total - first), 999.9) \
             if total > first else 0.0
-        if not type(self)._last_line_turn:
+        now = time.monotonic()
+        if now - type(self)._last_turn_at > type(self)._TURN_HEAD_GAP_S:
             self._turn_head(api)
         cells = "   ".join(f.format(v) for (_, f), v in
                            zip(self._TURN_COLS,
@@ -800,22 +806,28 @@ class Handler(BaseHTTPRequestHandler):
         print(f"{api + ':':<11}{cells}   {calls or 'none'}"
               + (f", mtp {stats.get('mtp_accepted', 0)}/{stats.get('mtp_steps', 0)}" if mtp else ""),
               flush=True)
-        # TTFT stages (rs=restore, pf=prefill, fw=forward); checkpoint
-        # save is a negligible fixed cost and is not shown. Each value
-        # is back-aligned under the table column one to its right:
-        # restore under reused, prefill under ttft(s), forward under
-        # rate(t/s). Field widths come from the head line itself so
-        # they can never drift from the table above.
-        label = "ttft(rs+pf+fw):"
+        # TTFT stages (restore/prefill/forward); checkpoint save is a
+        # negligible fixed cost and is not shown. The label covers the
+        # first two table columns, so each value is back-aligned under
+        # the next free column: restore under ttft(s), prefill under
+        # rate(t/s), forward under tools. Field widths come from the
+        # head line itself so they can never drift from the table above.
+        label = "ttft(restore+prefill+forward):"
         ends = type(self)._turn_col_ends()
         start = len(label)
         fields = []
-        for key, i in zip(("restore_s", "prefill_s", "forward_s"), (1, 2, 3)):
+        for key, i in zip(("restore_s", "prefill_s", "forward_s"), (2, 3, 4)):
             value = f"{stats.get(key, 0.0):.1f}"
-            fields.append(value.rjust(ends[i] - start + 1))
-            start = ends[i] + 1
+            if ends[i] < start:
+                # Target column is covered by the label; sit right
+                # after whatever precedes this value instead.
+                fields.append(value)
+                start += len(value)
+            else:
+                fields.append(value.rjust(ends[i] - start + 1))
+                start = ends[i] + 1
         print(label + "".join(fields), flush=True)
-        type(self)._last_line_turn = True
+        type(self)._last_turn_at = time.monotonic()
 
     # --- Responses API ---------------------------------------------
 
