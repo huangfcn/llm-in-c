@@ -377,7 +377,8 @@ The llama.cpp row above is not the strongest local stack on this machine. The
 same five workloads were run through mlx-lm 0.31.3 / mlx 0.32.0 and oMLX 0.5.7
 on 2026-08-18, both resident, greedy, one warmup first, against
 `mlx-community/Qwen3.8-27B-4bit` — the same checkpoint this runtime compiles
-its images from, with no requantization on either side. Reply token counts
+its images from, with no requantization on either side (the DeltaNet Q8 weights comes 
+from `mlx-community/Qwen3.8-27B-bf16` (54G)). Reply token counts
 differ between stacks because the completions differ; this compares
 throughput, not tokens.
 
