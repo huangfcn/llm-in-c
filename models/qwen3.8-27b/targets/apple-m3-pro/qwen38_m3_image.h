@@ -17,7 +17,7 @@
     "76663c101e7e8ea9c0ae17bcb95183cd7f733ce424c912b8b264a7b1c48e4cc6"
 
 enum {
-    QWEN38_M3_IMAGE_VERSION = 3,
+    QWEN38_M3_IMAGE_VERSION = 4,             /* was 3 */
     QWEN38_M3_MLP_ONLY_IMAGE_VERSION = 2,
     QWEN38_M3_IMAGE_HEADER_BYTES = 4096,
     QWEN38_M3_SOURCE_SHA256_LENGTH = 64
@@ -77,13 +77,17 @@ typedef struct {
     uint64_t delta_output_quants_bytes;
     uint64_t delta_output_metadata_offset;
     uint64_t delta_output_metadata_bytes;
+    uint32_t delta_input_precision;      /* 0 = Q4 (rows*hidden/2), 1 = Q8 (rows*hidden) */
+    uint32_t delta_output_precision;     /* 0 = Q4, 1 = Q8     (stays 0 in Milestone A) */
     float source_layer_reference_first_8[8];
     char mlp_source_sha256[QWEN38_M3_SOURCE_SHA256_LENGTH + 1];
     unsigned char reserved[QWEN38_M3_IMAGE_HEADER_BYTES - 8 - 12 * 4 -
                            8 * 4 - 12 * 8 - 16 * 8 -
                            (QWEN38_M3_SOURCE_SHA256_LENGTH + 1) - 3 -
                            24 * sizeof(float) -
-                           (QWEN38_M3_SOURCE_SHA256_LENGTH + 1) - 4];
+                           (QWEN38_M3_SOURCE_SHA256_LENGTH + 1) -
+                           2 * 4 -               /* <-- ADD: delta_input/output_precision */
+                           4];
 } qwen38_m3_image_header;
 
 _Static_assert(sizeof(qwen38_m3_image_header) == QWEN38_M3_IMAGE_HEADER_BYTES,

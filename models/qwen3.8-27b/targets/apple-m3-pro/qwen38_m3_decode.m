@@ -62,6 +62,15 @@ enum {
     id<MTLComputePipelineState> rms_f32;
     id<MTLComputePipelineState> convert_hidden;
     id<MTLComputePipelineState> gemm_f16;
+    /* Scalar Q8 twin of gemm_f16 for the transcoded delta-input plane
+     * (Milestone A); same dispatch shape and buffer bindings. */
+    id<MTLComputePipelineState> gemm_f16_q8_scalar;
+    /* Q8 half MMA twin of gemm_f16_mma2 (Milestone B). */
+    id<MTLComputePipelineState> gemm_f16_q8_mma2;
+    /* Q8 wide-tile half MMA twin of gemm_f16_mma3 (Milestone B). */
+    id<MTLComputePipelineState> gemm_f16_q8_mma3;
+    /* Q8 wide small-batch half MMA twin of gemm_f16_mma8w (Milestone B). */
+    id<MTLComputePipelineState> gemm_f16_q8_mma8w;
     id<MTLComputePipelineState> gemm_f32_residual_f16;
     id<MTLComputePipelineState> gemm_f32_residual_f32;
     id<MTLComputePipelineState> gemm_f16_mma;
@@ -231,6 +240,9 @@ enum {
     id<MTLComputePipelineState> rms_half;
     id<MTLComputePipelineState> rms_float;
     id<MTLComputePipelineState> delta_inputs;
+    /* Q8 twin of delta_inputs for images tagged delta_input_precision == 1
+     * (Milestone A lossless Q4 -> Q8 transcode of the delta-input plane). */
+    id<MTLComputePipelineState> delta_inputs_q8;
     id<MTLComputePipelineState> delta_conv;
     id<MTLComputePipelineState> delta_prepare;
     id<MTLComputePipelineState> delta_recurrent;
@@ -466,6 +478,9 @@ static int validate_delta_header(const qwen38_m3_image_header *h,
         h->delta_output_rows != 5120 ||
         h->delta_output_groups_per_row != 96 ||
         h->constants_f32_count != 51424 ||
+        (h->delta_input_precision != 0 &&
+         h->delta_input_precision != 1) ||
+        h->delta_output_precision != 0 ||
         !pinned_sha(h->source_sha256) ||
         (h->mlp_source_sha256[0] != '\0' &&
          !pinned_sha(h->mlp_source_sha256))) return -1;
@@ -721,7 +736,8 @@ static void encode_delta(Q38DecodeRuntime *r,
     const qwen38_m3_image_header *h = layer->delta_header;
     encode_rms_half(r, encoder, r->hidden_half, layer->constants,
                     h->input_norm_constants_index * sizeof(float));
-    [encoder setComputePipelineState:r->delta_inputs];
+    [encoder setComputePipelineState:h->delta_input_precision == 1 ?
+        r->delta_inputs_q8 : r->delta_inputs];
     [encoder setBuffer:r->normalized offset:0 atIndex:0];
     [encoder setBuffer:layer->input_quants offset:0 atIndex:1];
     [encoder setBuffer:layer->input_metadata offset:0 atIndex:2];
@@ -885,6 +901,11 @@ static Q38PrefillPipelines *prefill_pipelines(
     MAKE_PREFILL(rms_f32, @"qwen38_prefill_rmsnorm_f32");
     MAKE_PREFILL(convert_hidden, @"qwen38_prefill_convert_hidden");
     MAKE_PREFILL(gemm_f16, @"qwen38_prefill_q4_gemm_f16");
+    MAKE_PREFILL(gemm_f16_q8_scalar, @"qwen38_prefill_q8_gemm_f16_scalar");
+    MAKE_PREFILL(gemm_f16_q8_mma2, @"qwen38_prefill_q8_gemm_f16_mma2");
+    MAKE_PREFILL(gemm_f16_q8_mma3, @"qwen38_prefill_q8_gemm_f16_mma3");
+    MAKE_PREFILL(gemm_f16_q8_mma8w,
+                 @"qwen38_prefill_q8_gemm_f16_mma8w");
     MAKE_PREFILL(gemm_f32_residual_f16,
                  @"qwen38_prefill_q4_gemm_f32_residual_f16");
     MAKE_PREFILL(gemm_f32_residual_f32,
@@ -1183,9 +1204,70 @@ static void encode_prefill_delta(Q38DecodeRuntime *r,
     [encoder setBuffer:normalized offset:0 atIndex:2];
     [encoder dispatchThreadgroups:MTLSizeMake(p->batch, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-    encode_prefill_gemm_f16(r, p, encoder, normalized,
-                            layer->input_quants, layer->input_metadata,
-                            projected, 16480, 80);
+    if (h->delta_input_precision == 1) {
+        /* The Q8 code plane holds one signed int8 per weight (64 bytes
+         * per block), so the Q4 MMA kernels — which read two nibbles
+         * per byte from a 32-byte plane — would misread it. The Q8
+         * twins below mirror each Q4 MMA path exactly, differing only
+         * in the signed-int8 dequant loop; batches without a Q8 twin
+         * yet fall back to the scalar Q8 kernel. */
+        q38_prefill_gemm_parameters parameters = {16480, 80};
+        int use_mma = r->prefill_mma_level > 0 &&
+                      (int)p->batch >= r->mma_min_batch;
+        if (use_mma && r->prefill_mma_level >= 3) {
+            /* Wide-tile half MMA (64 rows x 32 batch): the Q4 mma3
+             * shape. The kernel reads x as half and normalized is
+             * already the rmsnorm_f16 output, so no staging dispatch. */
+            [encoder setComputePipelineState:p->gemm_f16_q8_mma3];
+            [encoder setBuffer:normalized offset:0 atIndex:0];
+            [encoder setBuffer:layer->input_quants offset:0 atIndex:1];
+            [encoder setBuffer:layer->input_metadata offset:0 atIndex:2];
+            [encoder setBuffer:projected offset:0 atIndex:3];
+            [encoder setBytes:&parameters length:sizeof(parameters) atIndex:4];
+            [encoder dispatchThreadgroups:
+                MTLSizeMake((16480 + 63) / 64, (p->batch + 31) / 32, 1)
+                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        } else if (use_mma && r->prefill_mma_level == 2) {
+            /* Half MMA (32 rows x 32 batch): the Q4 mma2 shape. */
+            [encoder setComputePipelineState:p->gemm_f16_q8_mma2];
+            [encoder setBuffer:normalized offset:0 atIndex:0];
+            [encoder setBuffer:layer->input_quants offset:0 atIndex:1];
+            [encoder setBuffer:layer->input_metadata offset:0 atIndex:2];
+            [encoder setBuffer:projected offset:0 atIndex:3];
+            [encoder setBytes:&parameters length:sizeof(parameters) atIndex:4];
+            [encoder dispatchThreadgroups:
+                MTLSizeMake(16480 / 32, (p->batch + 31) / 32, 1)
+                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        } else if (!use_mma && r->fast_verify && r->prefill_mma_level > 0 &&
+                   p->batch >= 3 && p->batch <= 8 && r->wide_verify) {
+            /* Wide small-batch half MMA (64 rows, eight-row batch tile):
+             * the Q4 mma8w shape for the verify range. x is already
+             * half — the rmsnorm_f16 output — so no staging dispatch. */
+            [encoder setComputePipelineState:p->gemm_f16_q8_mma8w];
+            [encoder setBuffer:normalized offset:0 atIndex:0];
+            [encoder setBuffer:layer->input_quants offset:0 atIndex:1];
+            [encoder setBuffer:layer->input_metadata offset:0 atIndex:2];
+            [encoder setBuffer:projected offset:0 atIndex:3];
+            [encoder setBytes:&parameters length:sizeof(parameters) atIndex:4];
+            [encoder dispatchThreadgroups:
+                MTLSizeMake((16480 + 63) / 64, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        } else {
+            [encoder setComputePipelineState:p->gemm_f16_q8_scalar];
+            [encoder setBuffer:normalized offset:0 atIndex:0];
+            [encoder setBuffer:layer->input_quants offset:0 atIndex:1];
+            [encoder setBuffer:layer->input_metadata offset:0 atIndex:2];
+            [encoder setBuffer:projected offset:0 atIndex:3];
+            [encoder setBytes:&parameters length:sizeof(parameters) atIndex:4];
+            [encoder dispatchThreadgroups:
+                MTLSizeMake((16480 + 7) / 8, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        }
+    } else {
+        encode_prefill_gemm_f16(r, p, encoder, normalized,
+                                layer->input_quants, layer->input_metadata,
+                                projected, 16480, 80);
+    }
     NSUInteger ordinal = layer->delta_ordinal;
     int capture = prefill_capture(r, p);
     int x_half = prefill_x_half(r, p);
@@ -1488,6 +1570,7 @@ static int initialize_pipelines(Q38DecodeRuntime *r, NSString **message) {
     MAKE(rms_half, @"qwen38_rmsnorm_f16_to_f16");
     MAKE(rms_float, @"qwen38_rmsnorm_f32_to_f16");
     MAKE(delta_inputs, @"qwen38_q4_delta_inputs");
+    MAKE(delta_inputs_q8, @"qwen38_q8_delta_inputs");
     MAKE(delta_conv, @"qwen38_delta_causal_conv_silu");
     MAKE(delta_prepare, @"qwen38_delta_prepare");
     MAKE(delta_recurrent, @"qwen38_deltanet_direct");
@@ -1813,6 +1896,8 @@ qwen38_m3_model *qwen38_m3_model_open(
         r->flash_prefill = flash_prefill_env != NULL &&
                            flash_prefill_env[0] != '\0' &&
                            strcmp(flash_prefill_env, "0") != 0;
+        fprintf(stderr, "qwen38: flags flash_prefill=%d kv_q8=%d\n",
+                r->flash_prefill, r->kv_q8);
         r->layers = [NSMutableArray arrayWithCapacity:64];
         r->device = MTLCreateSystemDefaultDevice();
         NSError *metal_error = nil;
@@ -3164,8 +3249,8 @@ static void prefill_progress(uint32_t done, uint32_t total, double begin) {
     last_quarter = quarter;
     last_done = done;
     double elapsed = decode_seconds() - begin;
-    fprintf(stderr, "prefill progress: %7u/%7u new tokens (%4.2f, %8.1f s, "
-            "%6.0f tok/s)\n", done, total, (double)done / (double)total,
+    fprintf(stderr, "prefill progress: %8u/%8u new tokens (%4.2f, %9.1f s, "
+            "%7.0f tok/s)\n", done, total, (double)done / (double)total,
             elapsed,
             elapsed > 0.0 ? (double)done / elapsed : 0.0);
     fflush(stderr);

@@ -445,11 +445,50 @@ static int convert_metadata(int source, int output,
     return status;
 }
 
-static int append_weight(int source, int output,
-                         const qwen38_tensor_view *weight,
-                         uint64_t *output_offset) {
-    int status = copy_weight(source, output, weight, *output_offset);
-    *output_offset += weight->data_length;
+/* Lossless Q4 -> Q8 transcode: each packed byte expands to two signed
+ * int8 code bytes, low nibble first, high nibble second. Code i lands at
+ * byte i of the output block in the same weight order the Q4 nibbles used,
+ * so a kernel reading char2[lane] recovers exactly {w(2*lane), w(2*lane+1)}.
+ * The output plane is twice the input size. */
+static int append_transcode_q4_to_q8(int source, int output,
+                                     const qwen38_tensor_view *weight,
+                                     uint64_t *output_offset) {
+    enum { CHUNK_BYTES = 8 * 1024 * 1024 };
+    unsigned char *in_buffer = malloc(CHUNK_BYTES);
+    unsigned char *out_buffer = malloc(CHUNK_BYTES * 2);
+    if (in_buffer == NULL || out_buffer == NULL) {
+        free(in_buffer);
+        free(out_buffer);
+        return -1;
+    }
+    uint64_t done = 0;
+    int status = 0;
+    while (done < weight->data_length) {
+        size_t amount = (size_t)(weight->data_length - done);
+        if (amount > CHUNK_BYTES) {
+            amount = CHUNK_BYTES;
+        }
+        if (pread_exact(source, in_buffer, amount,
+                        weight->data_start + done) != 0) {
+            status = -1;
+            break;
+        }
+        for (size_t index = 0; index < amount; ++index) {
+            out_buffer[index * 2] = (unsigned char)(in_buffer[index] & 0x0f);
+            out_buffer[index * 2 + 1] = (unsigned char)(in_buffer[index] >> 4);
+        }
+        if (pwrite_exact(output, out_buffer, amount * 2,
+                         *output_offset + done * 2) != 0) {
+            status = -1;
+            break;
+        }
+        done += amount;
+    }
+    free(in_buffer);
+    free(out_buffer);
+    if (status == 0) {
+        *output_offset += weight->data_length * 2;
+    }
     return status;
 }
 
@@ -461,6 +500,135 @@ static int append_metadata(int source, int output,
     int status = convert_metadata(source, output, scales, biases, values,
                                   *output_offset);
     *output_offset += values * 2 * sizeof(uint16_t);
+    return status;
+}
+
+/* Open a quantizer plane file and require its size to match exactly. The
+ * quantizer emits one directory of raw planes per layer; a wrong-sized file
+ * means a stale or foreign quantization, so fail before writing anything. */
+static int open_q8_plane(const char *path, uint64_t expected_bytes,
+                         const char *label) {
+    struct stat info;
+    int file = open(path, O_RDONLY);
+    if (file < 0) {
+        fprintf(stderr, "open %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    if (fstat(file, &info) != 0) {
+        fprintf(stderr, "fstat %s: %s\n", path, strerror(errno));
+        close(file);
+        return -1;
+    }
+    if ((uint64_t)info.st_size != expected_bytes) {
+        fprintf(stderr, "%s: expected exactly %" PRIu64
+                " bytes, got %" PRIu64 "\n",
+                label, expected_bytes, (uint64_t)info.st_size);
+        close(file);
+        return -1;
+    }
+    return file;
+}
+
+/* The --q8-dir path: the quantizer already emitted this layer's real Q8
+ * delta-input plane - one signed int8 code per weight, row-major in the same
+ * row order the image uses (qkv rows, then z, then a, then b; 80 groups of
+ * 64 per row) - plus fp16 scale and bias planes. The codes are copied
+ * verbatim into the quants plane; scales and biases are interleaved into the
+ * metadata plane with no conversion (the quantizer emits fp16 directly).
+ * Both cursors advance by exactly the same amounts as the transcode path, so
+ * the header sizes and the final cursor self-check stay valid unchanged. */
+static int append_q8_delta_input(const char *q8_dir, unsigned layer_index,
+                                 int output, uint64_t *quant_cursor,
+                                 uint64_t *metadata_cursor) {
+    enum { CHUNK_VALUES = 1 << 20 };
+    char codes_path[512], scale_path[512], bias_path[512];
+    snprintf(codes_path, sizeof(codes_path),
+             "%s/layer-%02u/delta_input_q8_codes.i8", q8_dir, layer_index);
+    snprintf(scale_path, sizeof(scale_path),
+             "%s/layer-%02u/delta_input_q8_scale.f16", q8_dir, layer_index);
+    snprintf(bias_path, sizeof(bias_path),
+             "%s/layer-%02u/delta_input_q8_bias.f16", q8_dir, layer_index);
+    const uint64_t code_bytes =
+        (uint64_t)DELTA_INPUT_ROWS * QWEN38_HIDDEN_SIZE;
+    const uint64_t meta_values =
+        (uint64_t)DELTA_INPUT_ROWS *
+        (QWEN38_HIDDEN_SIZE / QWEN38_Q4_GROUP_SIZE);
+    int codes = open_q8_plane(codes_path, code_bytes,
+                              "delta_input_q8_codes.i8");
+    int scales = open_q8_plane(scale_path, meta_values * sizeof(uint16_t),
+                               "delta_input_q8_scale.f16");
+    int biases = open_q8_plane(bias_path, meta_values * sizeof(uint16_t),
+                               "delta_input_q8_bias.f16");
+    if (codes < 0 || scales < 0 || biases < 0) {
+        if (codes >= 0) close(codes);
+        if (scales >= 0) close(scales);
+        if (biases >= 0) close(biases);
+        return -1;
+    }
+    unsigned char *code_buffer = malloc(CHUNK_VALUES);
+    uint16_t *scale_buffer =
+        malloc(CHUNK_VALUES * sizeof(uint16_t));
+    uint16_t *bias_buffer =
+        malloc(CHUNK_VALUES * sizeof(uint16_t));
+    uint16_t *interleaved = malloc(CHUNK_VALUES * 2 * sizeof(uint16_t));
+    int status = -1;
+    if (code_buffer != NULL && scale_buffer != NULL && bias_buffer != NULL &&
+        interleaved != NULL) {
+        status = 0;
+        uint64_t code_done = 0;
+        while (code_done < code_bytes && status == 0) {
+            size_t amount = (size_t)(code_bytes - code_done);
+            if (amount > CHUNK_VALUES) {
+                amount = CHUNK_VALUES;
+            }
+            if (pread_exact(codes, code_buffer, amount, code_done) != 0 ||
+                pwrite_exact(output, code_buffer, amount,
+                             *quant_cursor + code_done) != 0) {
+                status = -1;
+                break;
+            }
+            code_done += amount;
+        }
+        if (status == 0) {
+            *quant_cursor += code_bytes;
+        }
+        uint64_t meta_done = 0;
+        while (meta_done < meta_values && status == 0) {
+            size_t amount = (size_t)(meta_values - meta_done);
+            if (amount > CHUNK_VALUES) {
+                amount = CHUNK_VALUES;
+            }
+            if (pread_exact(scales, scale_buffer, amount * sizeof(uint16_t),
+                            meta_done * sizeof(uint16_t)) != 0 ||
+                pread_exact(biases, bias_buffer, amount * sizeof(uint16_t),
+                            meta_done * sizeof(uint16_t)) != 0) {
+                status = -1;
+                break;
+            }
+            for (size_t index = 0; index < amount; ++index) {
+                interleaved[index * 2] = scale_buffer[index];
+                interleaved[index * 2 + 1] = bias_buffer[index];
+            }
+            if (pwrite_exact(output, interleaved,
+                             amount * 2 * sizeof(uint16_t),
+                             *metadata_cursor +
+                                 meta_done * 2 * sizeof(uint16_t)) != 0) {
+                status = -1;
+                break;
+            }
+            meta_done += amount;
+        }
+        if (status == 0) {
+            *metadata_cursor += meta_values * 2 * sizeof(uint16_t);
+        }
+    }
+    free(code_buffer);
+    free(scale_buffer);
+    free(bias_buffer);
+    free(interleaved);
+    close(codes);
+    close(scales);
+    close(biases);
     return status;
 }
 
@@ -499,13 +667,21 @@ static int find_tensor(const char *path, const char *name,
 }
 
 int main(int argc, char **argv) {
+    /* Optional trailing flag: --q8-dir DIR replaces the lossless Q4 -> Q8
+     * transcode with the quantizer's real Q8 planes for this layer. */
+    const char *q8_dir = NULL;
+    if (argc >= 2 && strcmp(argv[argc - 2], "--q8-dir") == 0) {
+        q8_dir = argv[argc - 1];
+        argc -= 2;
+    }
     if ((argc != 5 && argc != 7) ||
         strlen(argv[3]) != QWEN38_M3_SOURCE_SHA256_LENGTH ||
         (argc == 7 &&
          strlen(argv[6]) != QWEN38_M3_SOURCE_SHA256_LENGTH)) {
         fprintf(stderr, "usage: %s SOURCE.safetensors OUTPUT.q38delta "
                         "SOURCE_SHA256 LAYER_INDEX "
-                        "[MLP_SOURCE.safetensors MLP_SOURCE_SHA256]\n",
+                        "[MLP_SOURCE.safetensors MLP_SOURCE_SHA256] "
+                        "[--q8-dir Q8_LAYER_PLANES_DIR]\n",
                 argv[0]);
         return 2;
     }
@@ -752,9 +928,14 @@ int main(int argc, char **argv) {
         align_page((uint64_t)header.constants_f32_count * sizeof(float));
     header.delta_input_quants_offset =
         header.constants_offset + header.constants_bytes;
+    /* Milestone A: the delta-input plane is transcoded Q4 -> Q8 (lossless
+     * nibble expansion), so its quant bytes double; the tag records which
+     * code width the image carries. The delta-output plane stays Q4. */
+    header.delta_input_precision = 1;
+    header.delta_output_precision = 0;
     header.delta_input_quants_bytes =
-        delta_qkv_weight_bytes + delta_z_weight_bytes +
-        2 * delta_scalar_weight_bytes;
+        2 * (delta_qkv_weight_bytes + delta_z_weight_bytes +
+             2 * delta_scalar_weight_bytes);
     header.delta_input_metadata_offset =
         header.delta_input_quants_offset + header.delta_input_quants_bytes;
     uint64_t delta_input_metadata_payload =
@@ -862,26 +1043,31 @@ int main(int argc, char **argv) {
                  write_bf16_as_f32(source, output, &delta_norm,
                     header.constants_offset +
                     header.recurrent_norm_constants_index * sizeof(float)) != 0 ||
-                 append_weight(source, output, &delta_qkv_weight,
-                               &delta_quant_cursor) != 0 ||
-                 append_weight(source, output, &delta_z_weight,
-                               &delta_quant_cursor) != 0 ||
-                 append_weight(source, output, &delta_a_weight,
-                               &delta_quant_cursor) != 0 ||
-                 append_weight(source, output, &delta_b_weight,
-                               &delta_quant_cursor) != 0 ||
-                 append_metadata(source, output, &delta_qkv_scale,
-                                 &delta_qkv_bias,
-                                 &delta_metadata_cursor) != 0 ||
-                 append_metadata(source, output, &delta_z_scale,
-                                 &delta_z_bias,
-                                 &delta_metadata_cursor) != 0 ||
-                 append_metadata(source, output, &delta_a_scale,
-                                 &delta_a_bias,
-                                 &delta_metadata_cursor) != 0 ||
-                 append_metadata(source, output, &delta_b_scale,
-                                 &delta_b_bias,
-                                 &delta_metadata_cursor) != 0 ||
+                 (q8_dir != NULL
+                  ? append_q8_delta_input(q8_dir, layer_index, output,
+                                          &delta_quant_cursor,
+                                          &delta_metadata_cursor)
+                  : (append_transcode_q4_to_q8(
+                         source, output, &delta_qkv_weight,
+                         &delta_quant_cursor) != 0 ||
+                     append_transcode_q4_to_q8(source, output, &delta_z_weight,
+                                               &delta_quant_cursor) != 0 ||
+                     append_transcode_q4_to_q8(source, output, &delta_a_weight,
+                                               &delta_quant_cursor) != 0 ||
+                     append_transcode_q4_to_q8(source, output, &delta_b_weight,
+                                               &delta_quant_cursor) != 0 ||
+                     append_metadata(source, output, &delta_qkv_scale,
+                                     &delta_qkv_bias,
+                                     &delta_metadata_cursor) != 0 ||
+                     append_metadata(source, output, &delta_z_scale,
+                                     &delta_z_bias,
+                                     &delta_metadata_cursor) != 0 ||
+                     append_metadata(source, output, &delta_a_scale,
+                                     &delta_a_bias,
+                                     &delta_metadata_cursor) != 0 ||
+                     append_metadata(source, output, &delta_b_scale,
+                                     &delta_b_bias,
+                                     &delta_metadata_cursor) != 0)) != 0 ||
                  copy_weight(source, output, &delta_out_weight,
                              header.delta_output_quants_offset) != 0 ||
                  convert_metadata(source, output, &delta_out_scale,

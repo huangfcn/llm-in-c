@@ -892,3 +892,110 @@ int qwen38_m3_run_layer_benchmark(
         return 0;
     }
 }
+
+/* Additions to qwen38_m3_layer.m for the Q8 DeltaNet projection path.
+ *
+ * These mirror the existing cpu_q4_dot_half / cpu_q4_dot_float and
+ * encode_q4_rows exactly; the only change is the code-plane read
+ * (one SIGNED int8 per weight at block*64 instead of two nibbles at
+ * block*32). Metadata is the same qwen38_layer_q4_meta struct (fp16
+ * scale/bias), so it is reused as-is.
+ *
+ * IMPORTANT: read the code as (signed char). Using the raw char type is
+ * fine only if `char` is signed on this target (it is, on Apple clang for
+ * arm64), but the explicit cast documents intent and is safe regardless. */
+
+/* ---- CPU references (place next to cpu_q4_dot_half / cpu_q4_dot_float) ---- */
+
+static float cpu_q8_dot_half(const int8_t *quants,
+                             const qwen38_layer_q4_meta *metadata,
+                             const uint16_t *input, size_t row,
+                             size_t groups) {
+    float total = 0.0f;
+    for (size_t group = 0; group < groups; ++group) {
+        size_t block = row * groups + group;
+        float scale = layer_half_value(metadata[block].scale);
+        float bias = layer_half_value(metadata[block].bias);
+        for (size_t lane = 0; lane < 32; ++lane) {
+            /* Two signed codes per lane, at byte 2*lane and 2*lane+1 of the
+             * 64-byte block, matching the kernel's char2[lane] read. */
+            int c0 = (int)(int8_t)quants[block * 64 + lane * 2];
+            int c1 = (int)(int8_t)quants[block * 64 + lane * 2 + 1];
+            size_t index = group * 64 + lane * 2;
+            total += (scale * (float)c0 + bias) *
+                     layer_half_value(input[index]);
+            total += (scale * (float)c1 + bias) *
+                     layer_half_value(input[index + 1]);
+        }
+    }
+    return total;
+}
+
+static float cpu_q8_dot_float(const int8_t *quants,
+                              const qwen38_layer_q4_meta *metadata,
+                              const float *input, size_t row,
+                              size_t groups) {
+    float total = 0.0f;
+    for (size_t group = 0; group < groups; ++group) {
+        size_t block = row * groups + group;
+        float scale = layer_half_value(metadata[block].scale);
+        float bias = layer_half_value(metadata[block].bias);
+        for (size_t lane = 0; lane < 32; ++lane) {
+            int c0 = (int)(int8_t)quants[block * 64 + lane * 2];
+            int c1 = (int)(int8_t)quants[block * 64 + lane * 2 + 1];
+            size_t index = group * 64 + lane * 2;
+            total += (scale * (float)c0 + bias) * input[index];
+            total += (scale * (float)c1 + bias) * input[index + 1];
+        }
+    }
+    return total;
+}
+
+/* ---- Host binding twin (place next to encode_q4_rows) ---- */
+/* Byte-identical to encode_q4_rows: same four buffers in the same order,
+ * same grid/threadgroup. Only the pipeline (a Q8 GEMV) differs. */
+
+static void encode_q8_rows(id<MTLComputeCommandEncoder> encoder,
+                           id<MTLComputePipelineState> pipeline,
+                           id<MTLBuffer> input, id<MTLBuffer> quants,
+                           id<MTLBuffer> metadata, id<MTLBuffer> output,
+                           NSUInteger rows) {
+    [encoder setComputePipelineState:pipeline];
+    [encoder setBuffer:input offset:0 atIndex:0];
+    [encoder setBuffer:quants offset:0 atIndex:1];
+    [encoder setBuffer:metadata offset:0 atIndex:2];
+    [encoder setBuffer:output offset:0 atIndex:3];
+    NSUInteger groups = (rows + QWEN38_LAYER_SIMDGROUPS - 1) /
+                        QWEN38_LAYER_SIMDGROUPS;
+    [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(QWEN38_LAYER_THREADS, 1, 1)];
+}
+
+/*
+ * Wiring notes (do these when you flip a tensor to Q8):
+ *
+ * 1. Pipelines: add delta_inputs_q8 / delta_output_q8 to qwen38_layer_pipelines
+ *    and create them from "qwen38_q8_delta_inputs" /
+ *    "qwen38_q8_delta_output_residual".
+ *
+ * 2. encode_one_layer: for the promoted tensor, call encode_q8_rows (inputs)
+ *    or the output-residual encode with the _q8 pipeline instead of the Q4
+ *    one. The delta-output encode is not encode_q4_rows (it binds a residual
+ *    at index 3 and output at index 4) — mirror that existing block with the
+ *    _q8 pipeline; the buffer indices are unchanged.
+ *
+ * 3. cpu_layer_reference: switch the corresponding loop to cpu_q8_dot_half
+ *    (delta inputs) / cpu_q8_dot_float (delta output). Cast the mapped quant
+ *    pointer to const int8_t *.
+ *
+ * 4. Image/header: the Q8 delta quant segment is rows*hidden bytes (NOT
+ *    rows*hidden/2). validate_layer_image() and the header offset math must
+ *    use the doubled size for the promoted plane, and the packer must emit
+ *    fp16 (not BF16) scale/bias into the metadata plane, matching
+ *    layer_half_value(). This is a header-format change — version-bump it.
+ *
+ * 5. Gate: the single-layer max_abs_error_* check catches gross errors, but
+ *    the DeltaNet recurrence integrates in-proj error across the sequence,
+ *    so the real acceptance gate is multi-token argmax parity against the
+ *    pure-Q4 golden (>=100 tokens, DeltaNet-heavy prompt).
+ */

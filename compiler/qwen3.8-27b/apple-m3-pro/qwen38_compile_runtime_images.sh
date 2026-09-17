@@ -1,8 +1,8 @@
 #!/bin/sh
 set -eu
 
-if [ "$#" -ne 5 ]; then
-    echo "usage: $0 SHARD1 SHARD2 SHARD3 TOKENIZER_JSON OUTPUT_DIR" >&2
+if [ "$#" -ne 5 ] && [ "$#" -ne 6 ]; then
+    echo "usage: $0 SHARD1 SHARD2 SHARD3 TOKENIZER_JSON OUTPUT_DIR [Q8_DIR]" >&2
     exit 2
 fi
 
@@ -11,6 +11,14 @@ shard2=$2
 shard3=$3
 tokenizer_json=$4
 output_dir=$5
+q8_dir=
+if [ "$#" -eq 6 ]; then
+    q8_dir=$6
+    if [ ! -d "$q8_dir" ]; then
+        echo "missing Q8 delta-input planes dir: $q8_dir" >&2
+        exit 3
+    fi
+fi
 
 sha1=6cc1508e96fb5d0865dfd5753a79f4ec60651bf3e2a82844a7e8ae9c60528c0d
 sha2=83f2a20ca8058f486a3634a27faf99587f4cd3c156a83dee34fb99e6ac178670
@@ -68,20 +76,25 @@ while [ "$layer" -lt 64 ]; do
             "$core_source" "$output" "$core_sha" "$layer"
     else
         output="$output_dir/layer-$padded.q38delta"
+        if [ -n "$q8_dir" ]; then
+            q8_flags="--q8-dir $q8_dir"
+        else
+            q8_flags=
+        fi
         if [ "$layer" -eq 17 ]; then
             pack_if_missing "$output" \
                 "$repository/build/qwen38-m3-pack" \
                 "$core_source" "$output" "$core_sha" "$layer" \
-                "$shard2" "$sha2"
+                "$shard2" "$sha2" $q8_flags
         elif [ "$layer" -eq 42 ]; then
             pack_if_missing "$output" \
                 "$repository/build/qwen38-m3-pack" \
                 "$core_source" "$output" "$core_sha" "$layer" \
-                "$shard3" "$sha3"
+                "$shard3" "$sha3" $q8_flags
         else
             pack_if_missing "$output" \
                 "$repository/build/qwen38-m3-pack" \
-                "$core_source" "$output" "$core_sha" "$layer"
+                "$core_source" "$output" "$core_sha" "$layer" $q8_flags
         fi
     fi
     layer=$((layer + 1))

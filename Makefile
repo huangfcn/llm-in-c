@@ -58,6 +58,7 @@ QWEN38_COMPILER := compiler/qwen3.8-27b/apple-m3-pro
 QWEN38_M3_AIR := $(BUILD_DIR)/qwen38-m3-q4.air
 QWEN38_M3_DELTANET_AIR := $(BUILD_DIR)/qwen38-m3-deltanet.air
 QWEN38_M3_LAYER_AIR := $(BUILD_DIR)/qwen38-m3-layer.air
+QWEN38_M3_LAYER_Q8_AIR := $(BUILD_DIR)/qwen38-m3-layer-q8.air
 QWEN38_M3_ATTENTION_AIR := $(BUILD_DIR)/qwen38-m3-attention.air
 QWEN38_M3_GLOBAL_AIR := $(BUILD_DIR)/qwen38-m3-global.air
 QWEN38_M3_PREFILL_AIR := $(BUILD_DIR)/qwen38-m3-prefill.air
@@ -866,6 +867,10 @@ $(QWEN38_M3_LAYER_AIR): $(QWEN38_M3)/qwen38_layer.metal
 	mkdir -p $(BUILD_DIR)
 	xcrun -sdk macosx metal -c $< -o $@
 
+$(QWEN38_M3_LAYER_Q8_AIR): $(QWEN38_M3)/qwen38_layer_q8.metal
+	mkdir -p $(BUILD_DIR)
+	xcrun -sdk macosx metal -c $< -o $@
+
 $(QWEN38_M3_ATTENTION_AIR): $(QWEN38_M3)/qwen38_attention.metal
 	mkdir -p $(BUILD_DIR)
 	xcrun -sdk macosx metal -c $< -o $@
@@ -879,7 +884,8 @@ $(QWEN38_M3_PREFILL_AIR): $(QWEN38_M3)/qwen38_prefill.metal
 	xcrun -sdk macosx metal -c $< -o $@
 
 $(QWEN38_M3_METALLIB): $(QWEN38_M3_AIR) $(QWEN38_M3_DELTANET_AIR) \
-	$(QWEN38_M3_LAYER_AIR) $(QWEN38_M3_ATTENTION_AIR) \
+	$(QWEN38_M3_LAYER_AIR) $(QWEN38_M3_LAYER_Q8_AIR) \
+	$(QWEN38_M3_ATTENTION_AIR) \
 	$(QWEN38_M3_GLOBAL_AIR) $(QWEN38_M3_PREFILL_AIR)
 	xcrun -sdk macosx metallib $^ -o $@
 
