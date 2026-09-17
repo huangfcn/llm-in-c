@@ -92,7 +92,7 @@ QWEN38_MODEL_DIR=/path/to/qwen38-runtime \
 OpenAI-compatible server:
 
 ```sh
-QWEN38_MODEL_DIR=/path/to/qwen38-runtime tools/qwen38_serve.py
+QWEN38_MTP=1 QWEN38_FLASH_PREFILL=1 QWEN38_KV_Q8=0 QWEN38_PREFILL_PROGRESS=1 QWEN38_PREFILL_MAX_CHUNK=128 python tools/qwen38_serve.py --model-dir ../models/qwen38-runtime-q8 --port 8080 --thinking --context 98304 --max-tokens 20000
 # base URL: http://127.0.0.1:8199/v1
 ```
 
