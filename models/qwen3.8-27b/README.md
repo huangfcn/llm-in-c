@@ -24,7 +24,7 @@ The hybrid graph changes the optimization problem. DeltaNet layers carry recurre
 
 | Input | Revision / SHA-256 |
 |---|---|
-| Affine Q4 weights | `mlx-community/Qwen3.8-27B-4bit` at `3e6447f082e89cc7f0bc6e5441afd38dfce760ff` |
+| Affine Q4 weights | `mlx-community/Qwen3.8-27B-4bit` at `3e6447f082e89cc7f0bc6e5441afd38dfce760ff` and `mlx-community/Qwen3.8-27B-bf16` |
 | Weight shard 1 | `6cc1508e96fb5d0865dfd5753a79f4ec60651bf3e2a82844a7e8ae9c60528c0d` |
 | Weight shard 2 | `83f2a20ca8058f486a3634a27faf99587f4cd3c156a83dee34fb99e6ac178670` |
 | Weight shard 3 | `31b8c91ef899f79efaaa69e3d2c096f6e2ebeb2ff20e29222abbd9ebc79e560a` |
