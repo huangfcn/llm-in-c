@@ -9,6 +9,8 @@
 #include "qwen38_m3_image.h"
 
 #include <fcntl.h>
+#include <float.h>
+#include <math.h>
 #include <mach/mach.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -78,6 +80,9 @@ enum {
     id<MTLComputePipelineState> gemm_f32_residual_f32_mma;
     id<MTLComputePipelineState> gemm_f16_mma2;
     id<MTLComputePipelineState> gemm_f16_mma3;
+    id<MTLComputePipelineState> mlp_gate_up_silu_mma3;
+    id<MTLComputePipelineState> mlp_gate_silu_mma3;
+    id<MTLComputePipelineState> mlp_up_mul_mma3;
     id<MTLComputePipelineState> gemm_f32_residual_f16_mma3;
     id<MTLComputePipelineState> gemm_f32_residual_f32_mma3;
     id<MTLComputePipelineState> convert_x;
@@ -236,6 +241,16 @@ enum {
      * two-pass scores + softmax_value pair. Off by default until token
      * parity is measured on target hardware. */
     int flash_prefill;
+    /* FP16 flash-attention historical-KV block size. 64 is the original
+     * path; 128 selects qwen38_prefill_flash_attention_128. */
+    int flash_block;
+    /* QWEN38_FLASH_PV_REUSE: block-64 FP16 Flash kernel with P.V output
+     * accumulator kept in the simdgroup matrix across all 64 KV positions. */
+    int flash_pv_reuse;
+    /* QWEN38_FLASH_QK_REUSE: experimental extension of the P.V reuse
+     * kernel that keeps both QK score accumulators live so each Q tile is
+     * loaded once for the two position tiles owned by a simdgroup. */
+    int flash_qk_reuse;
 
     id<MTLComputePipelineState> rms_half;
     id<MTLComputePipelineState> rms_float;
@@ -392,6 +407,10 @@ struct qwen38_m3_model {
     const uint32_t *mtp_ctx;
     uint32_t mtp_ctx_count;
     uint32_t mtp_lookup_cooldown;
+    /* Target-logit row that produced the sampled-but-unprocessed token
+     * returned by the latest MTP step. Used only for rare loop escape. */
+    uint32_t mtp_next_logit_row;
+    int mtp_next_logits_valid;
 };
 
 static void decode_error(char *message, size_t capacity_value,
@@ -937,6 +956,12 @@ static Q38PrefillPipelines *prefill_pipelines(
     MAKE_PREFILL(gemm_f16_mma2, @"qwen38_prefill_q4_gemm_f16_mma2");
     MAKE_PREFILL(convert_x, @"qwen38_prefill_convert_x");
     MAKE_PREFILL(gemm_f16_mma3, @"qwen38_prefill_q4_gemm_f16_mma3");
+    MAKE_PREFILL(mlp_gate_up_silu_mma3,
+                 @"qwen38_prefill_q4_gate_up_silu_mma3");
+    MAKE_PREFILL(mlp_gate_silu_mma3,
+                 @"qwen38_prefill_q4_gate_silu_mma3");
+    MAKE_PREFILL(mlp_up_mul_mma3,
+                 @"qwen38_prefill_q4_up_mul_mma3");
     MAKE_PREFILL(gemm_f32_residual_f16_mma3,
                  @"qwen38_prefill_q4_gemm_f32_residual_f16_mma3");
     MAKE_PREFILL(gemm_f32_residual_f32_mma3,
@@ -964,7 +989,13 @@ static Q38PrefillPipelines *prefill_pipelines(
                      @"qwen38_prefill_attention_softmax_value");
     MAKE_PREFILL(flash_attention,
                  r->kv_q8 ? @"qwen38_prefill_flash_attention_q8" :
-                            @"qwen38_prefill_flash_attention");
+                 (r->flash_block == 128 ?
+                    @"qwen38_prefill_flash_attention_128" :
+                    (r->flash_qk_reuse ?
+                       @"qwen38_prefill_flash_attention_qkreuse_pvreuse" :
+                     (r->flash_pv_reuse ?
+                       @"qwen38_prefill_flash_attention_pvreuse" :
+                       @"qwen38_prefill_flash_attention"))));
     MAKE_PREFILL(mtp_fuse, @"qwen38_prefill_mtp_fuse");
 #undef MAKE_PREFILL
     return p;
@@ -1161,25 +1192,86 @@ static int prefill_x_half(Q38DecodeRuntime *r, Q38PrefillPipelines *p) {
            p->batch >= 3 && p->batch <= 8;
 }
 
+static int prefill_fused_mlp_mode(void) {
+    static int initialized = 0;
+    /* Measured winner on M3 Pro: mode 2 (partial gate/up/SiLU fusion).
+     * QWEN38_PREFILL_FUSED_MLP remains an optional override. */
+    static int mode = 2;
+    if (!initialized) {
+        const char *value = getenv("QWEN38_PREFILL_FUSED_MLP");
+        if (value != NULL && value[0] != '\0')
+            mode = atoi(value);
+        if (mode < 0 || mode > 2) mode = 2;
+        initialized = 1;
+    }
+    return mode;
+}
+
 static void encode_prefill_mlp(Q38DecodeRuntime *r, Q38PrefillPipelines *p,
                                id<MTLComputeCommandEncoder> encoder,
                                Q38DecodeLayer *layer) {
     id<MTLBuffer> post = prefill_buffer(r, p, 15);
-    encode_prefill_gemm_f16(r, p, encoder, post,
-                            layer->gate_quants, layer->gate_metadata,
-                            prefill_buffer(r, p, 16), 17408, 80);
-    encode_prefill_gemm_f16(r, p, encoder, post,
-                            layer->up_quants, layer->up_metadata,
-                            prefill_buffer(r, p, 17), 17408, 80);
-    [encoder setComputePipelineState:prefill_x_half(r, p) ?
-        p->silu_mul_cap : p->silu_mul];
-    [encoder setBuffer:prefill_buffer(r, p, 16) offset:0 atIndex:0];
-    [encoder setBuffer:prefill_buffer(r, p, 17) offset:0 atIndex:1];
-    [encoder setBuffer:prefill_buffer(r, p, 18) offset:0 atIndex:2];
-    if (prefill_x_half(r, p))
-        [encoder setBuffer:prefill_buffer(r, p, 20) offset:0 atIndex:3];
-    [encoder dispatchThreads:MTLSizeMake(17408, p->batch, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    int fused_mode = prefill_fused_mlp_mode();
+    int large_mma3 = r->prefill_mma_level >= 3 &&
+                     (int)p->batch >= r->mma_min_batch;
+    if (fused_mode == 1 && large_mma3) {
+        /* Full gate+up fusion. Kept for A/B; mode 1 was slower on M3 Pro. */
+        q38_prefill_gemm_parameters parameters = {17408, 80};
+        [encoder setComputePipelineState:p->mlp_gate_up_silu_mma3];
+        [encoder setBuffer:post offset:0 atIndex:0];
+        [encoder setBuffer:layer->gate_quants offset:0 atIndex:1];
+        [encoder setBuffer:layer->gate_metadata offset:0 atIndex:2];
+        [encoder setBuffer:layer->up_quants offset:0 atIndex:3];
+        [encoder setBuffer:layer->up_metadata offset:0 atIndex:4];
+        [encoder setBuffer:prefill_buffer(r, p, 18) offset:0 atIndex:5];
+        [encoder setBytes:&parameters length:sizeof(parameters) atIndex:6];
+        [encoder dispatchThreadgroups:
+            MTLSizeMake((17408 + 63) / 64, (p->batch + 31) / 32, 1)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    } else if (fused_mode == 2 && large_mma3) {
+        /* Partial fusion: preserve mma3 occupancy. Gate stores SiLU(gate);
+         * up GEMM multiplies by that plane in its store. This removes the
+         * raw-up plane and separate SiLU dispatch without enlarging TG
+         * scratch/register state. */
+        q38_prefill_gemm_parameters parameters = {17408, 80};
+
+        [encoder setComputePipelineState:p->mlp_gate_silu_mma3];
+        [encoder setBuffer:post offset:0 atIndex:0];
+        [encoder setBuffer:layer->gate_quants offset:0 atIndex:1];
+        [encoder setBuffer:layer->gate_metadata offset:0 atIndex:2];
+        [encoder setBuffer:prefill_buffer(r, p, 16) offset:0 atIndex:3];
+        [encoder setBytes:&parameters length:sizeof(parameters) atIndex:4];
+        [encoder dispatchThreadgroups:
+            MTLSizeMake((17408 + 63) / 64, (p->batch + 31) / 32, 1)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+        [encoder setComputePipelineState:p->mlp_up_mul_mma3];
+        [encoder setBuffer:post offset:0 atIndex:0];
+        [encoder setBuffer:layer->up_quants offset:0 atIndex:1];
+        [encoder setBuffer:layer->up_metadata offset:0 atIndex:2];
+        [encoder setBuffer:prefill_buffer(r, p, 16) offset:0 atIndex:3];
+        [encoder setBuffer:prefill_buffer(r, p, 18) offset:0 atIndex:4];
+        [encoder setBytes:&parameters length:sizeof(parameters) atIndex:5];
+        [encoder dispatchThreadgroups:
+            MTLSizeMake((17408 + 63) / 64, (p->batch + 31) / 32, 1)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    } else {
+        encode_prefill_gemm_f16(r, p, encoder, post,
+                                layer->gate_quants, layer->gate_metadata,
+                                prefill_buffer(r, p, 16), 17408, 80);
+        encode_prefill_gemm_f16(r, p, encoder, post,
+                                layer->up_quants, layer->up_metadata,
+                                prefill_buffer(r, p, 17), 17408, 80);
+        [encoder setComputePipelineState:prefill_x_half(r, p) ?
+            p->silu_mul_cap : p->silu_mul];
+        [encoder setBuffer:prefill_buffer(r, p, 16) offset:0 atIndex:0];
+        [encoder setBuffer:prefill_buffer(r, p, 17) offset:0 atIndex:1];
+        [encoder setBuffer:prefill_buffer(r, p, 18) offset:0 atIndex:2];
+        if (prefill_x_half(r, p))
+            [encoder setBuffer:prefill_buffer(r, p, 20) offset:0 atIndex:3];
+        [encoder dispatchThreads:MTLSizeMake(17408, p->batch, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
     encode_prefill_gemm_residual(r, p, encoder, prefill_buffer(r, p, 18),
                                  layer->down_quants, layer->down_metadata,
                                  prefill_buffer(r, p, 14),
@@ -1187,22 +1279,83 @@ static void encode_prefill_mlp(Q38DecodeRuntime *r, Q38PrefillPipelines *p,
                                  5120, 272, NO);
 }
 
+/* PROFILE=3 splits DeltaNet prefill layers into five measured GPU regions.
+ * The declarations live here because encode_prefill_delta is above the
+ * generic profile-reporting helpers in this file. */
+typedef struct Q38Profile Q38Profile;
+static int decode_profile_level(void);
+static void profile_split(Q38DecodeRuntime *r, Q38Profile *profile, int tag,
+                          id<MTLCommandBuffer> *command,
+                          id<MTLComputeCommandEncoder> *encoder);
+
+enum {
+    Q38_PROFILE_DELTA_INPUT = 0,
+    Q38_PROFILE_DELTA_PREP = 1,
+    Q38_PROFILE_DELTA_RECURRENT = 2,
+    Q38_PROFILE_DELTA_OUTPUT = 3,
+    Q38_PROFILE_DELTA_MLP = 4,
+    Q38_PROFILE_DELTA_STAGE_COUNT = 5,
+    Q38_PROFILE_TAG_DELTA_STAGE_BASE = 1000
+};
+
+static inline int profile_delta_stage_tag(unsigned layer, int stage) {
+    return Q38_PROFILE_TAG_DELTA_STAGE_BASE +
+           (int)layer * Q38_PROFILE_DELTA_STAGE_COUNT + stage;
+}
+
+static inline void profile_delta_split(Q38DecodeRuntime *r,
+                                       Q38Profile *profile,
+                                       unsigned layer, int stage,
+                                       id<MTLCommandBuffer> *command,
+                                       id<MTLComputeCommandEncoder> *encoder) {
+    if (profile != NULL && decode_profile_level() >= 3)
+        profile_split(r, profile, profile_delta_stage_tag(layer, stage),
+                      command, encoder);
+}
+
+enum {
+    Q38_PROFILE_ATTN_QKV = 0,
+    Q38_PROFILE_ATTN_SCAN = 1,
+    Q38_PROFILE_ATTN_OUTPUT = 2,
+    Q38_PROFILE_ATTN_MLP = 3,
+    Q38_PROFILE_ATTN_STAGE_COUNT = 4,
+    Q38_PROFILE_TAG_ATTN_STAGE_BASE = 2000
+};
+
+static inline int profile_attention_stage_tag(unsigned layer, int stage) {
+    return Q38_PROFILE_TAG_ATTN_STAGE_BASE +
+           (int)layer * Q38_PROFILE_ATTN_STAGE_COUNT + stage;
+}
+
+static inline void profile_attention_split(Q38DecodeRuntime *r,
+                                           Q38Profile *profile,
+                                           unsigned layer, int stage,
+                                           id<MTLCommandBuffer> *command,
+                                           id<MTLComputeCommandEncoder> *encoder) {
+    if (profile != NULL && decode_profile_level() >= 4)
+        profile_split(r, profile, profile_attention_stage_tag(layer, stage),
+                      command, encoder);
+}
+
 static void encode_prefill_delta(Q38DecodeRuntime *r,
                                  Q38PrefillPipelines *p,
-                                 id<MTLComputeCommandEncoder> encoder,
-                                 Q38DecodeLayer *layer) {
+                                 id<MTLCommandBuffer> *command,
+                                 id<MTLComputeCommandEncoder> *encoder,
+                                 Q38DecodeLayer *layer,
+                                 Q38Profile *profile,
+                                 unsigned layer_index) {
     const qwen38_m3_image_header *h = layer->delta_header;
     id<MTLBuffer> hidden = prefill_buffer(r, p, 1);
     id<MTLBuffer> normalized = prefill_buffer(r, p, 2);
     id<MTLBuffer> projected = prefill_buffer(r, p, 3);
     id<MTLBuffer> convolved = prefill_buffer(r, p, 4);
-    [encoder setComputePipelineState:p->rms_f16];
-    [encoder setBuffer:hidden offset:0 atIndex:0];
-    [encoder setBuffer:layer->constants
+    [*encoder setComputePipelineState:p->rms_f16];
+    [*encoder setBuffer:hidden offset:0 atIndex:0];
+    [*encoder setBuffer:layer->constants
                  offset:h->input_norm_constants_index * sizeof(float)
                 atIndex:1];
-    [encoder setBuffer:normalized offset:0 atIndex:2];
-    [encoder dispatchThreadgroups:MTLSizeMake(p->batch, 1, 1)
+    [*encoder setBuffer:normalized offset:0 atIndex:2];
+    [*encoder dispatchThreadgroups:MTLSizeMake(p->batch, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     if (h->delta_input_precision == 1) {
         /* The Q8 code plane holds one signed int8 per weight (64 bytes
@@ -1218,24 +1371,24 @@ static void encode_prefill_delta(Q38DecodeRuntime *r,
             /* Wide-tile half MMA (64 rows x 32 batch): the Q4 mma3
              * shape. The kernel reads x as half and normalized is
              * already the rmsnorm_f16 output, so no staging dispatch. */
-            [encoder setComputePipelineState:p->gemm_f16_q8_mma3];
-            [encoder setBuffer:normalized offset:0 atIndex:0];
-            [encoder setBuffer:layer->input_quants offset:0 atIndex:1];
-            [encoder setBuffer:layer->input_metadata offset:0 atIndex:2];
-            [encoder setBuffer:projected offset:0 atIndex:3];
-            [encoder setBytes:&parameters length:sizeof(parameters) atIndex:4];
-            [encoder dispatchThreadgroups:
+            [*encoder setComputePipelineState:p->gemm_f16_q8_mma3];
+            [*encoder setBuffer:normalized offset:0 atIndex:0];
+            [*encoder setBuffer:layer->input_quants offset:0 atIndex:1];
+            [*encoder setBuffer:layer->input_metadata offset:0 atIndex:2];
+            [*encoder setBuffer:projected offset:0 atIndex:3];
+            [*encoder setBytes:&parameters length:sizeof(parameters) atIndex:4];
+            [*encoder dispatchThreadgroups:
                 MTLSizeMake((16480 + 63) / 64, (p->batch + 31) / 32, 1)
                     threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         } else if (use_mma && r->prefill_mma_level == 2) {
             /* Half MMA (32 rows x 32 batch): the Q4 mma2 shape. */
-            [encoder setComputePipelineState:p->gemm_f16_q8_mma2];
-            [encoder setBuffer:normalized offset:0 atIndex:0];
-            [encoder setBuffer:layer->input_quants offset:0 atIndex:1];
-            [encoder setBuffer:layer->input_metadata offset:0 atIndex:2];
-            [encoder setBuffer:projected offset:0 atIndex:3];
-            [encoder setBytes:&parameters length:sizeof(parameters) atIndex:4];
-            [encoder dispatchThreadgroups:
+            [*encoder setComputePipelineState:p->gemm_f16_q8_mma2];
+            [*encoder setBuffer:normalized offset:0 atIndex:0];
+            [*encoder setBuffer:layer->input_quants offset:0 atIndex:1];
+            [*encoder setBuffer:layer->input_metadata offset:0 atIndex:2];
+            [*encoder setBuffer:projected offset:0 atIndex:3];
+            [*encoder setBytes:&parameters length:sizeof(parameters) atIndex:4];
+            [*encoder dispatchThreadgroups:
                 MTLSizeMake(16480 / 32, (p->batch + 31) / 32, 1)
                     threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         } else if (!use_mma && r->fast_verify && r->prefill_mma_level > 0 &&
@@ -1243,123 +1396,140 @@ static void encode_prefill_delta(Q38DecodeRuntime *r,
             /* Wide small-batch half MMA (64 rows, eight-row batch tile):
              * the Q4 mma8w shape for the verify range. x is already
              * half — the rmsnorm_f16 output — so no staging dispatch. */
-            [encoder setComputePipelineState:p->gemm_f16_q8_mma8w];
-            [encoder setBuffer:normalized offset:0 atIndex:0];
-            [encoder setBuffer:layer->input_quants offset:0 atIndex:1];
-            [encoder setBuffer:layer->input_metadata offset:0 atIndex:2];
-            [encoder setBuffer:projected offset:0 atIndex:3];
-            [encoder setBytes:&parameters length:sizeof(parameters) atIndex:4];
-            [encoder dispatchThreadgroups:
+            [*encoder setComputePipelineState:p->gemm_f16_q8_mma8w];
+            [*encoder setBuffer:normalized offset:0 atIndex:0];
+            [*encoder setBuffer:layer->input_quants offset:0 atIndex:1];
+            [*encoder setBuffer:layer->input_metadata offset:0 atIndex:2];
+            [*encoder setBuffer:projected offset:0 atIndex:3];
+            [*encoder setBytes:&parameters length:sizeof(parameters) atIndex:4];
+            [*encoder dispatchThreadgroups:
                 MTLSizeMake((16480 + 63) / 64, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         } else {
-            [encoder setComputePipelineState:p->gemm_f16_q8_scalar];
-            [encoder setBuffer:normalized offset:0 atIndex:0];
-            [encoder setBuffer:layer->input_quants offset:0 atIndex:1];
-            [encoder setBuffer:layer->input_metadata offset:0 atIndex:2];
-            [encoder setBuffer:projected offset:0 atIndex:3];
-            [encoder setBytes:&parameters length:sizeof(parameters) atIndex:4];
-            [encoder dispatchThreadgroups:
+            [*encoder setComputePipelineState:p->gemm_f16_q8_scalar];
+            [*encoder setBuffer:normalized offset:0 atIndex:0];
+            [*encoder setBuffer:layer->input_quants offset:0 atIndex:1];
+            [*encoder setBuffer:layer->input_metadata offset:0 atIndex:2];
+            [*encoder setBuffer:projected offset:0 atIndex:3];
+            [*encoder setBytes:&parameters length:sizeof(parameters) atIndex:4];
+            [*encoder dispatchThreadgroups:
                 MTLSizeMake((16480 + 7) / 8, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         }
     } else {
-        encode_prefill_gemm_f16(r, p, encoder, normalized,
+        encode_prefill_gemm_f16(r, p, *encoder, normalized,
                                 layer->input_quants, layer->input_metadata,
                                 projected, 16480, 80);
     }
+    profile_delta_split(r, profile, layer_index, Q38_PROFILE_DELTA_INPUT,
+                        command, encoder);
+
     NSUInteger ordinal = layer->delta_ordinal;
     int capture = prefill_capture(r, p);
     int x_half = prefill_x_half(r, p);
-    [encoder setComputePipelineState:capture ? p->delta_conv_cap :
+    [*encoder setComputePipelineState:capture ? p->delta_conv_cap :
                                                p->delta_conv];
-    [encoder setBuffer:projected offset:0 atIndex:0];
-    [encoder setBuffer:layer->constants
+    [*encoder setBuffer:projected offset:0 atIndex:0];
+    [*encoder setBuffer:layer->constants
                  offset:h->conv_constants_index * sizeof(float) atIndex:1];
-    [encoder setBuffer:layer->convolution_state offset:0 atIndex:2];
-    [encoder setBuffer:convolved offset:0 atIndex:3];
+    [*encoder setBuffer:layer->convolution_state offset:0 atIndex:2];
+    [*encoder setBuffer:convolved offset:0 atIndex:3];
     if (capture)
-        [encoder setBuffer:r->ckpt_conv_windows
+        [*encoder setBuffer:r->ckpt_conv_windows
                      offset:ordinal * Q38_CKPT_ROWS *
                             Q38_CKPT_CONV_POSITION_FLOATS * sizeof(float)
                     atIndex:4];
-    [encoder dispatchThreads:MTLSizeMake(10240, 1, 1)
+    [*encoder dispatchThreads:MTLSizeMake(10240, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-    [encoder setComputePipelineState:capture ? p->delta_prepare_cap :
+    [*encoder setComputePipelineState:capture ? p->delta_prepare_cap :
                                                p->delta_prepare];
-    [encoder setBuffer:convolved offset:0 atIndex:0];
-    [encoder setBuffer:projected offset:0 atIndex:1];
-    [encoder setBuffer:layer->constants
+    [*encoder setBuffer:convolved offset:0 atIndex:0];
+    [*encoder setBuffer:projected offset:0 atIndex:1];
+    [*encoder setBuffer:layer->constants
                  offset:h->a_log_constants_index * sizeof(float) atIndex:2];
-    [encoder setBuffer:layer->constants
+    [*encoder setBuffer:layer->constants
                  offset:h->dt_bias_constants_index * sizeof(float) atIndex:3];
-    [encoder setBuffer:prefill_buffer(r, p, 5) offset:0 atIndex:4];
-    [encoder setBuffer:prefill_buffer(r, p, 7) offset:0 atIndex:5];
-    [encoder setBuffer:prefill_buffer(r, p, 8) offset:0 atIndex:6];
-    [encoder setBuffer:prefill_buffer(r, p, 9) offset:0 atIndex:7];
-    [encoder setBuffer:prefill_buffer(r, p, 10) offset:0 atIndex:8];
+    [*encoder setBuffer:prefill_buffer(r, p, 5) offset:0 atIndex:4];
+    [*encoder setBuffer:prefill_buffer(r, p, 7) offset:0 atIndex:5];
+    [*encoder setBuffer:prefill_buffer(r, p, 8) offset:0 atIndex:6];
+    [*encoder setBuffer:prefill_buffer(r, p, 9) offset:0 atIndex:7];
+    [*encoder setBuffer:prefill_buffer(r, p, 10) offset:0 atIndex:8];
     if (capture) {
-        [encoder setBuffer:r->ckpt_key
+        [*encoder setBuffer:r->ckpt_key
                      offset:ordinal * Q38_CKPT_KV_LAYER_FLOATS *
                             sizeof(float)
                     atIndex:9];
-        [encoder setBuffer:r->ckpt_value
+        [*encoder setBuffer:r->ckpt_value
                      offset:ordinal * Q38_CKPT_KV_LAYER_FLOATS *
                             sizeof(float)
                     atIndex:10];
-        [encoder setBuffer:r->ckpt_decay
+        [*encoder setBuffer:r->ckpt_decay
                      offset:ordinal * Q38_CKPT_DB_LAYER_FLOATS *
                             sizeof(float)
                     atIndex:11];
-        [encoder setBuffer:r->ckpt_beta
+        [*encoder setBuffer:r->ckpt_beta
                      offset:ordinal * Q38_CKPT_DB_LAYER_FLOATS *
                             sizeof(float)
                     atIndex:12];
     }
-    [encoder dispatchThreadgroups:MTLSizeMake(48, p->batch, 1)
+    [*encoder dispatchThreadgroups:MTLSizeMake(48, p->batch, 1)
             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-    [encoder setComputePipelineState:p->delta_recurrent];
-    [encoder setBuffer:prefill_buffer(r, p, 5) offset:0 atIndex:0];
-    [encoder setBuffer:prefill_buffer(r, p, 7) offset:0 atIndex:1];
-    [encoder setBuffer:prefill_buffer(r, p, 8) offset:0 atIndex:2];
-    [encoder setBuffer:prefill_buffer(r, p, 9) offset:0 atIndex:3];
-    [encoder setBuffer:prefill_buffer(r, p, 10) offset:0 atIndex:4];
-    [encoder setBuffer:layer->recurrent_state offset:0 atIndex:5];
-    [encoder setBuffer:prefill_buffer(r, p, 11) offset:0 atIndex:6];
-    [encoder dispatchThreads:MTLSizeMake(48 * 128, 1, 1)
+    profile_delta_split(r, profile, layer_index, Q38_PROFILE_DELTA_PREP,
+                        command, encoder);
+
+    [*encoder setComputePipelineState:p->delta_recurrent];
+    [*encoder setBuffer:prefill_buffer(r, p, 5) offset:0 atIndex:0];
+    [*encoder setBuffer:prefill_buffer(r, p, 7) offset:0 atIndex:1];
+    [*encoder setBuffer:prefill_buffer(r, p, 8) offset:0 atIndex:2];
+    [*encoder setBuffer:prefill_buffer(r, p, 9) offset:0 atIndex:3];
+    [*encoder setBuffer:prefill_buffer(r, p, 10) offset:0 atIndex:4];
+    [*encoder setBuffer:layer->recurrent_state offset:0 atIndex:5];
+    [*encoder setBuffer:prefill_buffer(r, p, 11) offset:0 atIndex:6];
+    [*encoder dispatchThreads:MTLSizeMake(48 * 128, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-    [encoder setComputePipelineState:x_half ? p->delta_gated_norm_cap :
+    profile_delta_split(r, profile, layer_index, Q38_PROFILE_DELTA_RECURRENT,
+                        command, encoder);
+
+    [*encoder setComputePipelineState:x_half ? p->delta_gated_norm_cap :
                                                p->delta_gated_norm];
-    [encoder setBuffer:prefill_buffer(r, p, 11) offset:0 atIndex:0];
-    [encoder setBuffer:projected offset:0 atIndex:1];
-    [encoder setBuffer:layer->constants
+    [*encoder setBuffer:prefill_buffer(r, p, 11) offset:0 atIndex:0];
+    [*encoder setBuffer:projected offset:0 atIndex:1];
+    [*encoder setBuffer:layer->constants
                  offset:h->recurrent_norm_constants_index * sizeof(float)
                 atIndex:2];
-    [encoder setBuffer:prefill_buffer(r, p, 12) offset:0 atIndex:3];
-    if (x_half) [encoder setBuffer:prefill_buffer(r, p, 20) offset:0 atIndex:4];
-    [encoder dispatchThreadgroups:MTLSizeMake(48, p->batch, 1)
+    [*encoder setBuffer:prefill_buffer(r, p, 12) offset:0 atIndex:3];
+    if (x_half) [*encoder setBuffer:prefill_buffer(r, p, 20) offset:0 atIndex:4];
+    [*encoder dispatchThreadgroups:MTLSizeMake(48, p->batch, 1)
             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-    encode_prefill_gemm_residual(r, p, encoder, prefill_buffer(r, p, 12),
+    encode_prefill_gemm_residual(r, p, *encoder, prefill_buffer(r, p, 12),
                                  layer->output_quants,
                                  layer->output_metadata,
                                  hidden, prefill_buffer(r, p, 14),
                                  5120, 96, YES);
-    [encoder setComputePipelineState:p->rms_f32];
-    [encoder setBuffer:prefill_buffer(r, p, 14) offset:0 atIndex:0];
-    [encoder setBuffer:layer->constants
+    [*encoder setComputePipelineState:p->rms_f32];
+    [*encoder setBuffer:prefill_buffer(r, p, 14) offset:0 atIndex:0];
+    [*encoder setBuffer:layer->constants
                  offset:h->post_norm_constants_index * sizeof(float)
                 atIndex:1];
-    [encoder setBuffer:prefill_buffer(r, p, 15) offset:0 atIndex:2];
-    [encoder dispatchThreadgroups:MTLSizeMake(p->batch, 1, 1)
+    [*encoder setBuffer:prefill_buffer(r, p, 15) offset:0 atIndex:2];
+    [*encoder dispatchThreadgroups:MTLSizeMake(p->batch, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-    encode_prefill_mlp(r, p, encoder, layer);
+    profile_delta_split(r, profile, layer_index, Q38_PROFILE_DELTA_OUTPUT,
+                        command, encoder);
+
+    encode_prefill_mlp(r, p, *encoder, layer);
+    profile_delta_split(r, profile, layer_index, Q38_PROFILE_DELTA_MLP,
+                        command, encoder);
 }
 
-static void encode_prefill_attention(Q38DecodeRuntime *r,
-                                     Q38PrefillPipelines *p,
-                                     id<MTLComputeCommandEncoder> encoder,
-                                     Q38DecodeLayer *layer,
-                                     uint32_t start_position) {
+static void encode_prefill_attention_profiled(Q38DecodeRuntime *r,
+                                              Q38PrefillPipelines *p,
+                                              id<MTLCommandBuffer> *command,
+                                              id<MTLComputeCommandEncoder> *encoder,
+                                              Q38DecodeLayer *layer,
+                                              uint32_t start_position,
+                                              Q38Profile *profile,
+                                              unsigned layer_index) {
     const qwen38_m3_attention_image_header *h = layer->attention_header;
     q38_prefill_attention_parameters parameters = {
         start_position, r->capacity, p->batch
@@ -1367,97 +1537,119 @@ static void encode_prefill_attention(Q38DecodeRuntime *r,
     id<MTLBuffer> hidden = prefill_buffer(r, p, 1);
     id<MTLBuffer> normalized = prefill_buffer(r, p, 2);
     id<MTLBuffer> projected = prefill_buffer(r, p, 3);
-    [encoder setComputePipelineState:p->rms_f16];
-    [encoder setBuffer:hidden offset:0 atIndex:0];
-    [encoder setBuffer:layer->constants
+    [*encoder setComputePipelineState:p->rms_f16];
+    [*encoder setBuffer:hidden offset:0 atIndex:0];
+    [*encoder setBuffer:layer->constants
                  offset:h->input_norm_constants_index * sizeof(float)
                 atIndex:1];
-    [encoder setBuffer:normalized offset:0 atIndex:2];
-    [encoder dispatchThreadgroups:MTLSizeMake(p->batch, 1, 1)
+    [*encoder setBuffer:normalized offset:0 atIndex:2];
+    [*encoder dispatchThreadgroups:MTLSizeMake(p->batch, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-    encode_prefill_gemm_f16(r, p, encoder, normalized,
+    encode_prefill_gemm_f16(r, p, *encoder, normalized,
                             layer->input_quants, layer->input_metadata,
                             projected, 14336, 80);
-    [encoder setComputePipelineState:p->attention_query];
-    [encoder setBuffer:projected offset:0 atIndex:0];
-    [encoder setBuffer:layer->constants
+    [*encoder setComputePipelineState:p->attention_query];
+    [*encoder setBuffer:projected offset:0 atIndex:0];
+    [*encoder setBuffer:layer->constants
                  offset:h->q_norm_constants_index * sizeof(float) atIndex:1];
-    [encoder setBytes:&parameters length:sizeof(parameters) atIndex:2];
-    [encoder setBuffer:prefill_buffer(r, p, 5) offset:0 atIndex:3];
-    [encoder setBuffer:prefill_buffer(r, p, 6) offset:0 atIndex:4];
-    [encoder dispatchThreadgroups:MTLSizeMake(24, p->batch, 1)
+    [*encoder setBytes:&parameters length:sizeof(parameters) atIndex:2];
+    [*encoder setBuffer:prefill_buffer(r, p, 5) offset:0 atIndex:3];
+    [*encoder setBuffer:prefill_buffer(r, p, 6) offset:0 atIndex:4];
+    [*encoder dispatchThreadgroups:MTLSizeMake(24, p->batch, 1)
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-    [encoder setComputePipelineState:p->attention_key_value];
-    [encoder setBuffer:projected offset:0 atIndex:0];
-    [encoder setBuffer:layer->constants
+    [*encoder setComputePipelineState:p->attention_key_value];
+    [*encoder setBuffer:projected offset:0 atIndex:0];
+    [*encoder setBuffer:layer->constants
                  offset:h->k_norm_constants_index * sizeof(float) atIndex:1];
-    [encoder setBytes:&parameters length:sizeof(parameters) atIndex:2];
-    [encoder setBuffer:layer->key_cache offset:0 atIndex:3];
-    [encoder setBuffer:layer->value_cache offset:0 atIndex:4];
-    [encoder dispatchThreadgroups:MTLSizeMake(4, p->batch, 1)
+    [*encoder setBytes:&parameters length:sizeof(parameters) atIndex:2];
+    [*encoder setBuffer:layer->key_cache offset:0 atIndex:3];
+    [*encoder setBuffer:layer->value_cache offset:0 atIndex:4];
+    [*encoder dispatchThreadgroups:MTLSizeMake(4, p->batch, 1)
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    profile_attention_split(r, profile, layer_index, Q38_PROFILE_ATTN_QKV,
+                            command, encoder);
     if (r->flash_prefill) {
         /* Single-pass flash attention: one 4-simdgroup threadgroup per
-         * 8 query rows of a q-head streams K/V in 64-position blocks with
-         * an online softmax and 8x8 simdgroup matrix multiply-accumulates,
-         * so the scores matrix is never materialized. */
-        [encoder setComputePipelineState:p->flash_attention];
-        [encoder setBuffer:prefill_buffer(r, p, 5) offset:0 atIndex:0];
-        [encoder setBuffer:layer->key_cache offset:0 atIndex:1];
-        [encoder setBuffer:layer->value_cache offset:0 atIndex:2];
-        [encoder setBuffer:prefill_buffer(r, p, 6) offset:0 atIndex:3];
-        [encoder setBytes:&parameters length:sizeof(parameters) atIndex:4];
-        [encoder setBuffer:prefill_buffer(r, p, 12) offset:0 atIndex:5];
+         * 8 query rows of a q-head streams K/V in 64- or 128-position
+         * blocks with an online softmax and 8x8 simdgroup MMAs, so the
+         * scores matrix is never materialized. */
+        [*encoder setComputePipelineState:p->flash_attention];
+        [*encoder setBuffer:prefill_buffer(r, p, 5) offset:0 atIndex:0];
+        [*encoder setBuffer:layer->key_cache offset:0 atIndex:1];
+        [*encoder setBuffer:layer->value_cache offset:0 atIndex:2];
+        [*encoder setBuffer:prefill_buffer(r, p, 6) offset:0 atIndex:3];
+        [*encoder setBytes:&parameters length:sizeof(parameters) atIndex:4];
+        [*encoder setBuffer:prefill_buffer(r, p, 12) offset:0 atIndex:5];
         if (prefill_x_half(r, p))
-            [encoder setBuffer:prefill_buffer(r, p, 20) offset:0 atIndex:6];
+            [*encoder setBuffer:prefill_buffer(r, p, 20) offset:0 atIndex:6];
         if (r->kv_q8)
             /* The Q8 flash kernel stages its dequantized K/V tiles in a
              * dynamic threadgroup buffer (16 positions x 256 dims x 2 bytes
              * each). */
-            [encoder setThreadgroupMemoryLength:16 * 256 * 2 * 2 atIndex:0];
+            [*encoder setThreadgroupMemoryLength:16 * 256 * 2 * 2 atIndex:0];
         /* The flash kernel handles 8 query rows per threadgroup. */
-        [encoder dispatchThreadgroups:
+        [*encoder dispatchThreadgroups:
             MTLSizeMake(24, (p->batch + 7) / 8, 1)
                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     } else {
-        [encoder setComputePipelineState:p->attention_scores];
-        [encoder setBuffer:prefill_buffer(r, p, 5) offset:0 atIndex:0];
-        [encoder setBuffer:layer->key_cache offset:0 atIndex:1];
-        [encoder setBytes:&parameters length:sizeof(parameters) atIndex:2];
-        [encoder setBuffer:prefill_buffer(r, p, 13) offset:0 atIndex:3];
+        [*encoder setComputePipelineState:p->attention_scores];
+        [*encoder setBuffer:prefill_buffer(r, p, 5) offset:0 atIndex:0];
+        [*encoder setBuffer:layer->key_cache offset:0 atIndex:1];
+        [*encoder setBytes:&parameters length:sizeof(parameters) atIndex:2];
+        [*encoder setBuffer:prefill_buffer(r, p, 13) offset:0 atIndex:3];
         NSUInteger score_count = 24 * (start_position + p->batch);
-        [encoder dispatchThreadgroups:
+        [*encoder dispatchThreadgroups:
             MTLSizeMake((score_count + 7) / 8, p->batch, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        [encoder setComputePipelineState:prefill_x_half(r, p) ?
+        [*encoder setComputePipelineState:prefill_x_half(r, p) ?
             p->attention_softmax_value_cap : p->attention_softmax_value];
-        [encoder setBuffer:prefill_buffer(r, p, 13) offset:0 atIndex:0];
-        [encoder setBuffer:layer->value_cache offset:0 atIndex:1];
-        [encoder setBuffer:prefill_buffer(r, p, 6) offset:0 atIndex:2];
-        [encoder setBytes:&parameters length:sizeof(parameters) atIndex:3];
-        [encoder setBuffer:prefill_buffer(r, p, 12) offset:0 atIndex:4];
+        [*encoder setBuffer:prefill_buffer(r, p, 13) offset:0 atIndex:0];
+        [*encoder setBuffer:layer->value_cache offset:0 atIndex:1];
+        [*encoder setBuffer:prefill_buffer(r, p, 6) offset:0 atIndex:2];
+        [*encoder setBytes:&parameters length:sizeof(parameters) atIndex:3];
+        [*encoder setBuffer:prefill_buffer(r, p, 12) offset:0 atIndex:4];
         if (prefill_x_half(r, p))
-            [encoder setBuffer:prefill_buffer(r, p, 20) offset:0 atIndex:5];
-        [encoder dispatchThreadgroups:MTLSizeMake(24, p->batch, 1)
+            [*encoder setBuffer:prefill_buffer(r, p, 20) offset:0 atIndex:5];
+        [*encoder dispatchThreadgroups:MTLSizeMake(24, p->batch, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     }
-    encode_prefill_gemm_residual(r, p, encoder, prefill_buffer(r, p, 12),
+    profile_attention_split(r, profile, layer_index, Q38_PROFILE_ATTN_SCAN,
+                            command, encoder);
+    encode_prefill_gemm_residual(r, p, *encoder, prefill_buffer(r, p, 12),
                                  layer->output_quants,
                                  layer->output_metadata,
                                  hidden, prefill_buffer(r, p, 14),
                                  5120, 96, YES);
-    [encoder setComputePipelineState:p->rms_f32];
-    [encoder setBuffer:prefill_buffer(r, p, 14) offset:0 atIndex:0];
-    [encoder setBuffer:layer->constants
+    [*encoder setComputePipelineState:p->rms_f32];
+    [*encoder setBuffer:prefill_buffer(r, p, 14) offset:0 atIndex:0];
+    [*encoder setBuffer:layer->constants
                  offset:h->post_norm_constants_index * sizeof(float)
                 atIndex:1];
-    [encoder setBuffer:prefill_buffer(r, p, 15) offset:0 atIndex:2];
-    [encoder dispatchThreadgroups:MTLSizeMake(p->batch, 1, 1)
+    [*encoder setBuffer:prefill_buffer(r, p, 15) offset:0 atIndex:2];
+    [*encoder dispatchThreadgroups:MTLSizeMake(p->batch, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-    encode_prefill_mlp(r, p, encoder, layer);
+    profile_attention_split(r, profile, layer_index, Q38_PROFILE_ATTN_OUTPUT,
+                            command, encoder);
+    encode_prefill_mlp(r, p, *encoder, layer);
+    profile_attention_split(r, profile, layer_index, Q38_PROFILE_ATTN_MLP,
+                            command, encoder);
 }
 
-/* Kernel-class GPU profiling (QWEN38_PROFILE=1, =2 adds per-layer lines).
+/* Non-profiled callers (MTP prefill) keep the original interface. */
+static void encode_prefill_attention(Q38DecodeRuntime *r,
+                                     Q38PrefillPipelines *p,
+                                     id<MTLComputeCommandEncoder> encoder,
+                                     Q38DecodeLayer *layer,
+                                     uint32_t start_position) {
+    id<MTLCommandBuffer> unused_command = nil;
+    id<MTLComputeCommandEncoder> local_encoder = encoder;
+    encode_prefill_attention_profiled(r, p, &unused_command, &local_encoder,
+                                      layer, start_position, NULL, 0);
+}
+
+/* Kernel-class GPU profiling (QWEN38_PROFILE=1, =2 adds per-layer lines,
+ * =3 splits DeltaNet layers into input/prep/recurrent/output/MLP regions,
+ * =4 also splits attention layers into qkv+prep/scan/output/MLP regions).
  * Apple GPUs sample counters only at encoder boundaries, so the profile
  * mode splits the one-command-buffer graph into one command buffer per
  * region on the same serial queue — execution order and results are
@@ -1473,10 +1665,10 @@ static int decode_profile_level(void) {
     return cached;
 }
 
-typedef struct {
+struct Q38Profile {
     NSMutableArray *commands;
     NSMutableArray *tags;
-} Q38Profile;
+};
 
 enum { Q38_PROFILE_TAG_SNAPSHOT = -2, Q38_PROFILE_TAG_EMBED = -1,
        Q38_PROFILE_TAG_HEAD = 64 };
@@ -1497,6 +1689,8 @@ static void profile_report(Q38DecodeRuntime *r, Q38Profile *profile,
                            const char *label) {
     double snapshot = 0, embed = 0, delta = 0, attention = 0, head = 0;
     double per_layer[64] = {0};
+    double delta_stage[Q38_PROFILE_DELTA_STAGE_COUNT] = {0};
+    double attention_stage[Q38_PROFILE_ATTN_STAGE_COUNT] = {0};
     for (NSUInteger index = 0; index < profile->commands.count; ++index) {
         id<MTLCommandBuffer> command = profile->commands[index];
         int tag = [profile->tags[index] intValue];
@@ -1504,7 +1698,25 @@ static void profile_report(Q38DecodeRuntime *r, Q38Profile *profile,
         if (tag == Q38_PROFILE_TAG_SNAPSHOT) snapshot += ms;
         else if (tag == Q38_PROFILE_TAG_EMBED) embed += ms;
         else if (tag == Q38_PROFILE_TAG_HEAD) head += ms;
-        else {
+        else if (tag >= Q38_PROFILE_TAG_DELTA_STAGE_BASE &&
+                 tag < Q38_PROFILE_TAG_DELTA_STAGE_BASE +
+                       64 * Q38_PROFILE_DELTA_STAGE_COUNT) {
+            int encoded = tag - Q38_PROFILE_TAG_DELTA_STAGE_BASE;
+            int layer_index = encoded / Q38_PROFILE_DELTA_STAGE_COUNT;
+            int stage = encoded % Q38_PROFILE_DELTA_STAGE_COUNT;
+            per_layer[layer_index] += ms;
+            delta_stage[stage] += ms;
+            delta += ms;
+        } else if (tag >= Q38_PROFILE_TAG_ATTN_STAGE_BASE &&
+                   tag < Q38_PROFILE_TAG_ATTN_STAGE_BASE +
+                         64 * Q38_PROFILE_ATTN_STAGE_COUNT) {
+            int encoded = tag - Q38_PROFILE_TAG_ATTN_STAGE_BASE;
+            int layer_index = encoded / Q38_PROFILE_ATTN_STAGE_COUNT;
+            int stage = encoded % Q38_PROFILE_ATTN_STAGE_COUNT;
+            per_layer[layer_index] += ms;
+            attention_stage[stage] += ms;
+            attention += ms;
+        } else {
             per_layer[tag] += ms;
             Q38DecodeLayer *layer = r->layers[(NSUInteger)tag];
             if (layer->attention) attention += ms;
@@ -1516,7 +1728,33 @@ static void profile_report(Q38DecodeRuntime *r, Q38Profile *profile,
             "delta48 %.2f (avg %.3f), attn16 %.2f (avg %.3f), head %.2f\n",
             label, snapshot + embed + delta + attention + head, snapshot,
             embed, delta, delta / 48.0, attention, attention / 16.0, head);
-    if (decode_profile_level() >= 2)
+    if (decode_profile_level() >= 3) {
+        static const char *names[Q38_PROFILE_DELTA_STAGE_COUNT] = {
+            "input", "prep", "recurrent", "output", "mlp"
+        };
+        double staged = 0.0;
+        fprintf(stderr, "[profile %s] delta breakdown avg/layer:", label);
+        for (int stage = 0; stage < Q38_PROFILE_DELTA_STAGE_COUNT; ++stage) {
+            staged += delta_stage[stage];
+            fprintf(stderr, " %s %.3f", names[stage],
+                    delta_stage[stage] / 48.0);
+        }
+        fprintf(stderr, " other %.3f ms\n", (delta - staged) / 48.0);
+    }
+    if (decode_profile_level() >= 4) {
+        static const char *names[Q38_PROFILE_ATTN_STAGE_COUNT] = {
+            "qkv+prep", "scan", "output", "mlp"
+        };
+        double staged = 0.0;
+        fprintf(stderr, "[profile %s] attn breakdown avg/layer:", label);
+        for (int stage = 0; stage < Q38_PROFILE_ATTN_STAGE_COUNT; ++stage) {
+            staged += attention_stage[stage];
+            fprintf(stderr, " %s %.3f", names[stage],
+                    attention_stage[stage] / 16.0);
+        }
+        fprintf(stderr, " other %.3f ms\n", (attention - staged) / 16.0);
+    }
+    if (decode_profile_level() >= 2 && decode_profile_level() < 3)
         for (int index = 0; index < 64; ++index) {
             Q38DecodeLayer *layer = r->layers[(NSUInteger)index];
             fprintf(stderr, "[profile %s] layer %02d %s %.3f ms\n", label,
@@ -1543,9 +1781,10 @@ static void encode_prefill_chunk(Q38DecodeRuntime *r,
     for (unsigned index = 0; index < 64; ++index) {
         Q38DecodeLayer *layer = r->layers[index];
         if (layer->attention)
-            encode_prefill_attention(r, p, *encoder, layer, start_position);
+            encode_prefill_attention_profiled(r, p, command, encoder, layer,
+                                              start_position, profile, index);
         else
-            encode_prefill_delta(r, p, *encoder, layer);
+            encode_prefill_delta(r, p, command, encoder, layer, profile, index);
         if (index != 63) {
             [*encoder setComputePipelineState:p->convert_hidden];
             [*encoder setBuffer:prefill_buffer(r, p, 19) offset:0 atIndex:0];
@@ -1890,14 +2129,63 @@ qwen38_m3_model *qwen38_m3_model_open(
         Q38DecodeRuntime *r = [Q38DecodeRuntime new];
         r->capacity = context_capacity;
         const char *kv_q8_env = getenv("QWEN38_KV_Q8");
+        /* Measured winner: FP16 KV.  QWEN38_KV_Q8=1 is still available
+         * as an explicit override for experiments. */
         r->kv_q8 = kv_q8_env != NULL && kv_q8_env[0] != '\0' &&
                    strcmp(kv_q8_env, "0") != 0;
         const char *flash_prefill_env = getenv("QWEN38_FLASH_PREFILL");
-        r->flash_prefill = flash_prefill_env != NULL &&
-                           flash_prefill_env[0] != '\0' &&
+        /* Measured winner: Flash prefill enabled by default. */
+        r->flash_prefill = flash_prefill_env == NULL ||
+                           flash_prefill_env[0] == '\0' ||
                            strcmp(flash_prefill_env, "0") != 0;
-        fprintf(stderr, "qwen38: flags flash_prefill=%d kv_q8=%d\n",
-                r->flash_prefill, r->kv_q8);
+        r->flash_block = 64;
+        const char *flash_block_env = getenv("QWEN38_FLASH_BLOCK");
+        if (flash_block_env != NULL && flash_block_env[0] != '\0') {
+            int requested = atoi(flash_block_env);
+            if (requested == 64 || requested == 128)
+                r->flash_block = requested;
+            else
+                fprintf(stderr,
+                        "qwen38: ignoring QWEN38_FLASH_BLOCK=%s "
+                        "(expected 64 or 128)\n", flash_block_env);
+        }
+        if (r->kv_q8 && r->flash_block != 64) {
+            fprintf(stderr,
+                    "qwen38: Q8 KV currently uses the 64-position flash "
+                    "kernel; forcing flash_block=64\n");
+            r->flash_block = 64;
+        }
+        const char *flash_pv_reuse_env = getenv("QWEN38_FLASH_PV_REUSE");
+        /* Measured winner: keep the P.V accumulator live across the full
+         * 64-position block.  Set QWEN38_FLASH_PV_REUSE=0 to disable. */
+        r->flash_pv_reuse = flash_pv_reuse_env == NULL ||
+                            flash_pv_reuse_env[0] == '\0' ||
+                            strcmp(flash_pv_reuse_env, "0") != 0;
+        if (r->flash_pv_reuse && (r->kv_q8 || r->flash_block != 64)) {
+            fprintf(stderr,
+                    "qwen38: P.V reuse kernel requires FP16 KV and "
+                    "flash_block=64; disabling flash_pv_reuse\n");
+            r->flash_pv_reuse = 0;
+        }
+        const char *flash_qk_reuse_env = getenv("QWEN38_FLASH_QK_REUSE");
+        /* Measured winner: reuse each Q tile for both position tiles owned
+         * by the simdgroup.  Set QWEN38_FLASH_QK_REUSE=0 to disable. */
+        r->flash_qk_reuse = flash_qk_reuse_env == NULL ||
+                            flash_qk_reuse_env[0] == '\0' ||
+                            strcmp(flash_qk_reuse_env, "0") != 0;
+        if (r->flash_qk_reuse &&
+            (r->kv_q8 || r->flash_block != 64 || !r->flash_pv_reuse)) {
+            fprintf(stderr,
+                    "qwen38: QK reuse requires FP16 KV, flash_block=64, "
+                    "and flash_pv_reuse=1; disabling flash_qk_reuse\n");
+            r->flash_qk_reuse = 0;
+        }
+        fprintf(stderr,
+                "qwen38: flags flash_prefill=%d flash_block=%d "
+                "flash_pv_reuse=%d flash_qk_reuse=%d kv_q8=%d "
+                "fused_mlp=%d\n",
+                r->flash_prefill, r->flash_block, r->flash_pv_reuse,
+                r->flash_qk_reuse, r->kv_q8, prefill_fused_mlp_mode());
         r->layers = [NSMutableArray arrayWithCapacity:64];
         r->device = MTLCreateSystemDefaultDevice();
         NSError *metal_error = nil;
@@ -2011,6 +2299,7 @@ void qwen38_m3_model_reset(qwen38_m3_model *model) {
                r->mtp_layer->value_cache.length);
     }
     model->mtp_hidden_source = 0;
+    model->mtp_next_logits_valid = 0;
 }
 
 int qwen38_m3_model_forward_submit(
@@ -2822,6 +3111,49 @@ static uint32_t argmax_f32(const float *values, uint32_t count) {
     return best;
 }
 
+/* Small CPU helpers used only by the adaptive lattice path. The normal
+ * speculative path stays entirely unchanged. */
+static double logsumexp_f32(const float *values, uint32_t count) {
+    if (values == NULL || count == 0) return -HUGE_VAL;
+    float maximum = values[0];
+    for (uint32_t i = 1; i < count; ++i)
+        if (values[i] > maximum) maximum = values[i];
+    double sum = 0.0;
+    for (uint32_t i = 0; i < count; ++i)
+        sum += exp((double)values[i] - (double)maximum);
+    return (double)maximum + log(sum);
+}
+
+static double token_logprob_f32(const float *values, uint32_t count,
+                                uint32_t token) {
+    if (values == NULL || token >= count) return -HUGE_VAL;
+    return (double)values[token] - logsumexp_f32(values, count);
+}
+
+static uint32_t topk_f32(const float *values, uint32_t count, uint32_t k,
+                         uint32_t ids[8], float scores[8]) {
+    if (k > 8) k = 8;
+    if (k > count) k = count;
+    if (k == 0) return 0;
+    for (uint32_t i = 0; i < k; ++i) {
+        ids[i] = 0;
+        scores[i] = -FLT_MAX;
+    }
+    for (uint32_t id = 0; id < count; ++id) {
+        float value = values[id];
+        if (value <= scores[k - 1]) continue;
+        uint32_t pos = k - 1;
+        while (pos != 0 && value > scores[pos - 1]) {
+            scores[pos] = scores[pos - 1];
+            ids[pos] = ids[pos - 1];
+            --pos;
+        }
+        scores[pos] = value;
+        ids[pos] = id;
+    }
+    return k;
+}
+
 int qwen38_m3_model_mtp_open(
     qwen38_m3_model *model, const char *layer_image_path,
     const char *extras_image_path, char *error_message,
@@ -3038,6 +3370,7 @@ int qwen38_m3_model_mtp_step(
         return 1;
     }
     Q38DecodeRuntime *r = (__bridge Q38DecodeRuntime *)model->runtime;
+    model->mtp_next_logits_valid = 0;
     if (r->mtp_layer == nil) {
         decode_error(error_message, error_message_capacity,
                      @"MTP images are not loaded");
@@ -3144,10 +3477,12 @@ int qwen38_m3_model_mtp_step(
 
     uint32_t emit_count;
     uint32_t next_pending;
+    uint32_t next_logit_row = 0;
     int used_rollback = 0;
     if (accepted_count == depth) {
         emit_count = depth + 1;
         next_pending = true_next[depth];
+        next_logit_row = depth;
     } else if (r->prefill_mma_level == 0 ||
                (getenv("QWEN38_REPLAY") != NULL &&
                 strcmp(getenv("QWEN38_REPLAY"), "1") == 0)) {
@@ -3168,8 +3503,9 @@ int qwen38_m3_model_mtp_step(
         if (status != 0) return status;
         logits = r->p_logits2.contents;
         emit_count = accepted_count + 2;
+        next_logit_row = accepted_count + 1;
         next_pending = argmax_f32(
-            logits + (size_t)(accepted_count + 1) * QWEN38_VOCAB_SIZE,
+            logits + (size_t)next_logit_row * QWEN38_VOCAB_SIZE,
             QWEN38_VOCAB_SIZE);
     } else {
         /* Replay-free: rebuild the GDN state at the last accepted row
@@ -3182,6 +3518,7 @@ int qwen38_m3_model_mtp_step(
         if (status != 0) return status;
         used_rollback = 1;
         emit_count = accepted_count + 1;
+        next_logit_row = accepted_count;
         next_pending = true_next[accepted_count];
     }
     *accepted = (int)accepted_count;
@@ -3211,6 +3548,8 @@ int qwen38_m3_model_mtp_step(
     *current_token = next_pending;
     *position = j + emit_count;
     model->mtp_hidden_source = (int)emit_count;
+    model->mtp_next_logit_row = next_logit_row;
+    model->mtp_next_logits_valid = 1;
     if (lookup_depth != 0) {
         /* A cold lookup pauses further lookups so misfiring spans do
          * not repeatedly displace the draft-model chain. */
@@ -3223,6 +3562,212 @@ int qwen38_m3_model_mtp_step(
             model->mtp_accept_ema = 0.85f * model->mtp_accept_ema +
                 (i < accepted_count ? 0.15f : 0.0f);
     }
+    return 0;
+}
+
+
+/*
+ * Adaptive Viterbi-style MTP lattice, v1.
+ *
+ * This is deliberately a small root-beam lookahead rather than a full
+ * exponentially branching beam tree: the target-model distribution that
+ * produced the current pending token supplies the top-B roots; each root
+ * is rolled forward D positions by the MTP draft model, then the target
+ * model verifies that complete path. We score every path by cumulative
+ * target log probability, restore the pre-branch recurrent state, and
+ * finally commit the best path.
+ *
+ * The expensive multi-path work is intended to be called only at uncertain
+ * or repetitive positions. Normal generation continues to use the original
+ * single-chain output-lossless MTP step.
+ */
+int qwen38_m3_model_mtp_lattice_step(
+    qwen38_m3_model *model,
+    uint32_t *current_token,
+    uint32_t *position,
+    uint32_t emitted[8],
+    uint32_t *emitted_count,
+    uint32_t beam_width,
+    uint32_t depth,
+    double *best_score_out,
+    double *runner_score_out,
+    uint32_t *chosen_rank_out,
+    char *error_message,
+    size_t error_message_capacity) {
+    if (model == NULL || model->runtime == NULL ||
+        current_token == NULL || position == NULL || emitted == NULL ||
+        emitted_count == NULL) {
+        decode_error(error_message, error_message_capacity,
+                     @"invalid MTP lattice arguments");
+        return 1;
+    }
+    Q38DecodeRuntime *r = (__bridge Q38DecodeRuntime *)model->runtime;
+    if (r->mtp_layer == nil || !model->mtp_next_logits_valid) {
+        decode_error(error_message, error_message_capacity,
+                     @"MTP lattice requires valid pending target logits");
+        return 1;
+    }
+
+    if (beam_width < 2) beam_width = 2;
+    if (beam_width > 8) beam_width = 8;
+    if (depth < 1) depth = 1;
+    if (depth > 7) depth = 7;
+    uint32_t j = *position;
+    while (depth > 1 && (uint64_t)j + depth + 1 > r->capacity) --depth;
+    if ((uint64_t)j + depth + 1 > r->capacity) {
+        decode_error(error_message, error_message_capacity,
+                     @"MTP lattice exceeds context capacity");
+        return 1;
+    }
+
+    const float *pending_logits =
+        (const float *)r->p_logits2.contents +
+        (size_t)model->mtp_next_logit_row * QWEN38_VOCAB_SIZE;
+    uint32_t root_ids[8];
+    float root_scores[8];
+    uint32_t roots = topk_f32(
+        pending_logits, QWEN38_VOCAB_SIZE, beam_width,
+        root_ids, root_scores);
+    if (roots == 0) {
+        decode_error(error_message, error_message_capacity,
+                     @"MTP lattice has no root candidates");
+        return 1;
+    }
+    double pending_lse = logsumexp_f32(
+        pending_logits, QWEN38_VOCAB_SIZE);
+
+    /* The hidden feeding the first draft belongs to the target state before
+     * current_token is processed. Preserve it because each branch overwrites
+     * the shared verify/draft workspaces. */
+    id<MTLBuffer> hidden_source = model->mtp_hidden_source == 0 ?
+        r->final_normalized : r->p_post_normalized;
+    NSUInteger hidden_offset = model->mtp_hidden_source >= 1 ?
+        (NSUInteger)(model->mtp_hidden_source - 1) * 5120 *
+            sizeof(uint16_t) : 0;
+    uint16_t saved_hidden[5120];
+    memcpy(saved_hidden,
+           (const unsigned char *)hidden_source.contents + hidden_offset,
+           sizeof(saved_hidden));
+
+    /* One recurrent/convolution snapshot is sufficient for every branch.
+     * Attention KV (including the MTP attention layer) is indexed by
+     * position, so branch rows j..j+D are simply overwritten. */
+    gdn_state_copy(r, 0);
+
+    uint32_t best_tokens[8] = {0};
+    double best_score = -HUGE_VAL;
+    double runner_score = -HUGE_VAL;
+    uint32_t best_rank = 0;
+
+    for (uint32_t branch = 0; branch < roots; ++branch) {
+        if (branch != 0)
+            gdn_state_copy(r, 1);
+
+        memcpy(r->final_normalized.contents, saved_hidden,
+               sizeof(saved_hidden));
+
+        uint32_t path[8] = {0};
+        path[0] = root_ids[branch];
+
+        /* Draft one greedy continuation for this root. These passes touch
+         * only the speculative MTP cache at future positions. */
+        for (uint32_t i = 0; i < depth; ++i) {
+            uint32_t draft = 0;
+            int status = run_mtp_pass(
+                model, 1, &path[i], j + i,
+                r->final_normalized, 0, 1, 0, &draft,
+                error_message, error_message_capacity);
+            if (status != 0) {
+                gdn_state_copy(r, 1);
+                return status;
+            }
+            path[i + 1] = draft;
+        }
+
+        int status = model_forward_batch(
+            model, path, depth + 1, j, 0,
+            error_message, error_message_capacity);
+        if (status != 0) {
+            gdn_state_copy(r, 1);
+            return status;
+        }
+
+        /* Viterbi-style path score: root probability under the target
+         * distribution that produced the pending token, plus the target
+         * conditional log probability of each drafted successor. */
+        double score =
+            (double)root_scores[branch] - pending_lse;
+        const float *verify_logits = r->p_logits2.contents;
+        for (uint32_t i = 0; i < depth; ++i) {
+            score += token_logprob_f32(
+                verify_logits + (size_t)i * QWEN38_VOCAB_SIZE,
+                QWEN38_VOCAB_SIZE, path[i + 1]);
+        }
+
+        if (score > best_score) {
+            runner_score = best_score;
+            best_score = score;
+            best_rank = branch;
+            memcpy(best_tokens, path,
+                   (size_t)(depth + 1) * sizeof(uint32_t));
+        } else if (score > runner_score) {
+            runner_score = score;
+        }
+    }
+
+    /* Return target state to the common prefix and commit only the winning
+     * path. Rebuild its MTP cache rows as well, because the last explored
+     * branch need not be the winner. */
+    gdn_state_copy(r, 1);
+    memcpy(r->final_normalized.contents, saved_hidden,
+           sizeof(saved_hidden));
+
+    int status = run_mtp_pass(
+        model, 1, &best_tokens[0], j,
+        r->final_normalized, 0, 0, 0, NULL,
+        error_message, error_message_capacity);
+    if (status != 0) return status;
+
+    status = model_forward_batch(
+        model, best_tokens, depth + 1, j, 0,
+        error_message, error_message_capacity);
+    if (status != 0) return status;
+
+    if (depth != 0) {
+        status = run_mtp_pass(
+            model, depth, best_tokens + 1, j + 1,
+            r->p_post_normalized, 0, 0, 0, NULL,
+            error_message, error_message_capacity);
+        if (status != 0) return status;
+    }
+
+    for (uint32_t i = 0; i <= depth; ++i)
+        emitted[i] = best_tokens[i];
+    *emitted_count = depth + 1;
+
+    const float *final_logits = (const float *)r->p_logits2.contents +
+        (size_t)depth * QWEN38_VOCAB_SIZE;
+    *current_token = argmax_f32(final_logits, QWEN38_VOCAB_SIZE);
+    *position = j + depth + 1;
+    model->mtp_hidden_source = (int)(depth + 1);
+    model->mtp_next_logit_row = depth;
+    model->mtp_next_logits_valid = 1;
+
+    if (best_score_out != NULL) *best_score_out = best_score;
+    if (runner_score_out != NULL) *runner_score_out = runner_score;
+    if (chosen_rank_out != NULL) *chosen_rank_out = best_rank;
+    return 0;
+}
+
+int qwen38_m3_model_mtp_next_logits(
+    qwen38_m3_model *model, const float **logits, size_t *logit_count) {
+    if (model == NULL || model->runtime == NULL || logits == NULL ||
+        logit_count == NULL || !model->mtp_next_logits_valid)
+        return 1;
+    Q38DecodeRuntime *r = (__bridge Q38DecodeRuntime *)model->runtime;
+    *logits = (const float *)r->p_logits2.contents +
+        (size_t)model->mtp_next_logit_row * QWEN38_VOCAB_SIZE;
+    *logit_count = QWEN38_VOCAB_SIZE;
     return 0;
 }
 
@@ -3239,9 +3784,11 @@ static void prefill_progress(uint32_t done, uint32_t total, double begin) {
      * the counter. */
     static uint32_t last_quarter = 0;
     static uint32_t last_done = 0;
-    if (enabled < 0)
-        enabled = getenv("QWEN38_PREFILL_PROGRESS") != NULL &&
-            getenv("QWEN38_PREFILL_PROGRESS")[0] != '0';
+    if (enabled < 0) {
+        const char *value = getenv("QWEN38_PREFILL_PROGRESS");
+        /* Default on for long local prefills; explicit 0 keeps stderr quiet. */
+        enabled = value == NULL || value[0] == '\0' || value[0] != '0';
+    }
     if (!enabled || total < 64) return;
     if (done <= last_done) { last_quarter = 0; last_done = 0; }
     uint32_t quarter = (done * 4) / total; /* 0..4 */

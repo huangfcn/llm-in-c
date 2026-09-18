@@ -137,6 +137,37 @@ int qwen38_m3_model_mtp_step(
     char *error_message,
     size_t error_message_capacity);
 
+
+/* Adaptive Viterbi-style multi-path lookahead. Requires target logits from a
+ * preceding MTP step. The top beam_width pending-token hypotheses are each
+ * extended depth positions by the MTP draft model, target-verified, and
+ * scored by cumulative target log probability; only the winning path is
+ * committed. This is intentionally an occasional rescue/search path, not
+ * the normal fast single-chain MTP step. beam_width <= 8, depth <= 7. */
+int qwen38_m3_model_mtp_lattice_step(
+    qwen38_m3_model *model,
+    uint32_t *current_token,
+    uint32_t *position,
+    uint32_t emitted[8],
+    uint32_t *emitted_count,
+    uint32_t beam_width,
+    uint32_t depth,
+    double *best_score,
+    double *runner_score,
+    uint32_t *chosen_rank,
+    char *error_message,
+    size_t error_message_capacity);
+
+/* Expose the target-model distribution that produced current_token after the
+ * most recent MTP step. Intended for rare recovery actions such as sampling
+ * one escape token after detecting a repetition loop, without disabling
+ * greedy MTP for the whole reply. The pointer is model-owned and remains
+ * valid only until the next model operation. */
+int qwen38_m3_model_mtp_next_logits(
+    qwen38_m3_model *model,
+    const float **logits,
+    size_t *logit_count);
+
 /* Optional context view for lookup drafting: tokens must stay valid and
  * cover the exact sequence the layer states correspond to (prompt plus
  * emitted tokens, excluding the pending token). When the trigram ending

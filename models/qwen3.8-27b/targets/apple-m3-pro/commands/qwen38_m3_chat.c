@@ -35,6 +35,64 @@ static uint32_t parse_u32(const char *text, uint32_t fallback) {
     return end != text && *end == '\0' ? (uint32_t)value : fallback;
 }
 
+static float parse_f32(const char *text, float fallback) {
+    if (text == NULL) return fallback;
+    char *end = NULL;
+    float value = strtof(text, &end);
+    return end != text && *end == '\0' ? value : fallback;
+}
+
+/* Exact periodic suffix detector. Requiring a reasonably long period and
+ * several repeats avoids flagging ordinary code punctuation/indentation. */
+static uint32_t repeated_suffix_period(const uint32_t *tokens, uint32_t count,
+                                       uint32_t min_period,
+                                       uint32_t max_period,
+                                       uint32_t repeats) {
+    if (tokens == NULL || repeats < 2 || min_period == 0 ||
+        count < min_period * repeats)
+        return 0;
+    uint32_t limit = count / repeats;
+    if (max_period > limit) max_period = limit;
+    for (uint32_t period = min_period; period <= max_period; ++period) {
+        uint32_t start = count - period * repeats;
+        int same = 1;
+        for (uint32_t r = 1; r < repeats; ++r) {
+            if (memcmp(tokens + start, tokens + start + r * period,
+                       (size_t)period * sizeof(*tokens)) != 0) {
+                same = 0;
+                break;
+            }
+        }
+        if (same) return period;
+    }
+    return 0;
+}
+
+static int repeated_token_run(const uint32_t *tokens, uint32_t count,
+                              uint32_t run) {
+    if (tokens == NULL || run < 2 || count < run) return 0;
+    uint32_t token = tokens[count - 1];
+    for (uint32_t i = 1; i < run; ++i)
+        if (tokens[count - 1 - i] != token) return 0;
+    return 1;
+}
+
+static float top2_logit_gap(const float *logits, size_t count) {
+    if (logits == NULL || count < 2) return 3.402823466e+38F;
+    float first = -3.402823466e+38F;
+    float second = -3.402823466e+38F;
+    for (size_t i = 0; i < count; ++i) {
+        float value = logits[i];
+        if (value > first) {
+            second = first;
+            first = value;
+        } else if (value > second) {
+            second = value;
+        }
+    }
+    return first - second;
+}
+
 static char *trim_prompt(const char *prompt) {
     const uint8_t *bytes = (const uint8_t *)prompt;
     int32_t length = (int32_t)strlen(prompt);
@@ -411,6 +469,51 @@ int main(int argc, char **argv) {
             fprintf(stderr, "MTP requested but unavailable: %s\n", error);
         }
     }
+    /* Repetition is not handled by a separate escape sampler. It is one of
+     * the signals that asks Adaptive Viterbi-MTP to search multiple paths. */
+    uint32_t viterbi_repeat_min_period = parse_u32(
+        getenv("QWEN38_MTP_VITERBI_REPEAT_MIN_PERIOD"), 12);
+    uint32_t viterbi_repeat_max_period = parse_u32(
+        getenv("QWEN38_MTP_VITERBI_REPEAT_MAX_PERIOD"), 96);
+    uint32_t viterbi_repeat_count = parse_u32(
+        getenv("QWEN38_MTP_VITERBI_REPEAT_COUNT"), 3);
+    uint32_t viterbi_repeat_same_run = parse_u32(
+        getenv("QWEN38_MTP_VITERBI_REPEAT_SAME_RUN"), 24);
+    if (viterbi_repeat_min_period == 0) viterbi_repeat_min_period = 1;
+    if (viterbi_repeat_max_period < viterbi_repeat_min_period)
+        viterbi_repeat_max_period = viterbi_repeat_min_period;
+    if (viterbi_repeat_count < 2) viterbi_repeat_count = 2;
+
+
+    const char *viterbi_env = getenv("QWEN38_MTP_VITERBI");
+    int viterbi_enabled =
+        viterbi_env != NULL && strcmp(viterbi_env, "0") != 0;
+    uint32_t viterbi_beam =
+        parse_u32(getenv("QWEN38_MTP_VITERBI_BEAM"), 4);
+    uint32_t viterbi_depth =
+        parse_u32(getenv("QWEN38_MTP_VITERBI_DEPTH"), 3);
+    float viterbi_gap =
+        parse_f32(getenv("QWEN38_MTP_VITERBI_GAP"), 0.08f);
+    uint32_t viterbi_cooldown =
+        parse_u32(getenv("QWEN38_MTP_VITERBI_COOLDOWN"), 128);
+    uint32_t viterbi_min_tokens =
+        parse_u32(getenv("QWEN38_MTP_VITERBI_MIN_TOKENS"), 64);
+    uint32_t viterbi_max_steps =
+        parse_u32(getenv("QWEN38_MTP_VITERBI_MAX_STEPS"), 3);
+    if (viterbi_beam < 2) viterbi_beam = 2;
+    if (viterbi_beam > 8) viterbi_beam = 8;
+    if (viterbi_depth < 1) viterbi_depth = 1;
+    if (viterbi_depth > 7) viterbi_depth = 7;
+    if (mtp && viterbi_enabled)
+        fprintf(stderr,
+            "Adaptive Viterbi-MTP active (beam %u, depth %u, "
+            "top1-top2 gap <= %.3f after %u tokens, cooldown %u; "
+            "repetition %u..%u x%u, same-run %u).\n",
+            viterbi_beam, viterbi_depth, viterbi_gap,
+            viterbi_min_tokens, viterbi_cooldown,
+            viterbi_repeat_min_period, viterbi_repeat_max_period,
+            viterbi_repeat_count, viterbi_repeat_same_run);
+
     if (machine) {
         printf("R {\"ready\": true, \"context\": %u, "
                "\"max_new\": %u}\n", capacity, maximum_new);
@@ -727,6 +830,9 @@ int main(int argc, char **argv) {
         double first_token_seconds = -1.0;
         size_t mtp_steps = 0;
         size_t mtp_accepts = 0;
+        size_t viterbi_steps = 0;
+        size_t viterbi_repetition_triggers = 0;
+        uint32_t next_viterbi_check = 0;
 
         if (use_mtp) {
             uint32_t pending;
@@ -753,10 +859,70 @@ int main(int argc, char **argv) {
                 int step_accepted = 0;
                 qwen38_m3_model_mtp_context(model, history,
                                             history_count);
-                if (qwen38_m3_model_mtp_step(
+
+                int use_viterbi_now = 0;
+                float confidence_gap = 3.402823466e+38F;
+                uint32_t trigger_period = 0;
+                int trigger_run = 0;
+                if (viterbi_enabled &&
+                    viterbi_steps < viterbi_max_steps &&
+                    generated_count >= next_viterbi_check) {
+                    const float *pending_logits = NULL;
+                    size_t pending_logit_count = 0;
+                    if (qwen38_m3_model_mtp_next_logits(
+                            model, &pending_logits,
+                            &pending_logit_count) == 0) {
+                        if (pending_logit_count > QWEN38_TOKENIZER_VOCAB)
+                            pending_logit_count = QWEN38_TOKENIZER_VOCAB;
+                        confidence_gap = top2_logit_gap(
+                            pending_logits, pending_logit_count);
+                        trigger_period = repeated_suffix_period(
+                            generated, generated_count,
+                            viterbi_repeat_min_period,
+                            viterbi_repeat_max_period,
+                            viterbi_repeat_count);
+                        trigger_run = repeated_token_run(
+                            generated, generated_count,
+                            viterbi_repeat_same_run);
+                        use_viterbi_now =
+                            trigger_period != 0 || trigger_run ||
+                            (generated_count >= viterbi_min_tokens &&
+                             confidence_gap <= viterbi_gap);
+                    }
+                }
+
+                int mtp_status;
+                if (use_viterbi_now) {
+                    double best_score = 0.0;
+                    double runner_score = 0.0;
+                    uint32_t chosen_rank = 0;
+                    mtp_status = qwen38_m3_model_mtp_lattice_step(
+                        model, &pending, &mtp_position, step_emitted,
+                        &step_count, viterbi_beam, viterbi_depth,
+                        &best_score, &runner_score, &chosen_rank,
+                        error, sizeof(error));
+                    if (mtp_status == 0) {
+                        ++viterbi_steps;
+                        if (trigger_period != 0 || trigger_run)
+                            ++viterbi_repetition_triggers;
+                        next_viterbi_check =
+                            generated_count + viterbi_cooldown;
+                        fprintf(stderr,
+                            "[viterbi-mtp] beam %u depth %u rank %u "
+                            "gap %.3f score %.3f margin %.3f%s%s\n",
+                            viterbi_beam, viterbi_depth, chosen_rank,
+                            confidence_gap, best_score,
+                            best_score - runner_score,
+                            trigger_period != 0 ? " repetition" : "",
+                            trigger_run ? " run" : "");
+                    }
+                } else {
+                    mtp_status = qwen38_m3_model_mtp_step(
                         model, &pending, &mtp_position, step_emitted,
                         &step_count, &step_accepted, error,
-                        sizeof(error)) != 0) {
+                        sizeof(error));
+                }
+                if (mtp_status != 0) {
                     fprintf(stderr, "MTP step failed: %s\n", error);
                     failed = 1;
                     break;
@@ -773,6 +939,7 @@ int main(int argc, char **argv) {
                         generated_count >= budget)
                         done = 1;
                 }
+
                 visible_count = generated_count;
                 if (generated_count != 0 &&
                     (generated[generated_count - 1] ==
@@ -853,6 +1020,8 @@ int main(int argc, char **argv) {
                        "\"first_token_s\": %.3f, \"total_s\": %.3f, "
                        "\"stop\": \"%s\", \"mtp_steps\": %zu, "
                        "\"mtp_accepted\": %zu, \"mtp_depth\": %d, "
+                       "\"viterbi_steps\": %zu, "
+                       "\"viterbi_repetition_triggers\": %zu, "
                        "\"prefilled_from\": %u, \"restore_s\": %.3f, "
                        "\"prefill_s\": %.3f, \"forward_s\": %.3f, "
                        "\"save_s\": %.3f, \"footprint_gb\": %.2f}\n",
@@ -861,8 +1030,9 @@ int main(int argc, char **argv) {
                            first_token_seconds : 0.0,
                        total_seconds,
                        stopped ? "stop" : "length",
-                       mtp_steps, mtp_accepts, mtp_depth,
-                       start_position, stage_restore, stage_prefill,
+                       mtp_steps, mtp_accepts, mtp_depth, viterbi_steps,
+                       viterbi_repetition_triggers, start_position,
+                       stage_restore, stage_prefill,
                        stage_forward, stage_save,
                        (double)qwen38_m3_model_footprint(model) /
                            (1024.0 * 1024.0 * 1024.0));
@@ -873,7 +1043,7 @@ int main(int argc, char **argv) {
             fflush(stdout);
             if (!failed && visible_count > 1 &&
                 total_seconds > first_token_seconds) {
-                if (mtp_steps != 0)
+                if (mtp_steps != 0) {
                     fprintf(stderr, "[first token %.2f s, %zu tokens, "
                             "%.1f tok/s, drafts accepted %zu over "
                             "%zu steps]\n",
@@ -881,12 +1051,17 @@ int main(int argc, char **argv) {
                             (double)(visible_count - 1) /
                             (total_seconds - first_token_seconds),
                             mtp_accepts, mtp_steps);
-                else
+                    if (viterbi_steps != 0)
+                        fprintf(stderr,
+                                "[adaptive Viterbi-MTP steps %zu]\n",
+                                viterbi_steps);
+                } else {
                     fprintf(stderr, "[first token %.2f s, %zu tokens, "
                             "%.1f tok/s]\n", first_token_seconds,
                             visible_count,
                             (double)(visible_count - 1) /
                             (total_seconds - first_token_seconds));
+                }
             } else if (!failed && first_token_seconds >= 0.0) {
                 fprintf(stderr, "[first token %.2f s]\n",
                         first_token_seconds);

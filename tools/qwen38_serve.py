@@ -633,7 +633,31 @@ class Engine:
 
 ENGINE = None
 THINKING_DEFAULT = False
-EFFORT_DEFAULT = "xhigh"
+EFFORT_DEFAULT = "medium"
+# Decode presets. "official" is the Qwen3.8 thinking-mode recommendation.
+# "mtp" and "viterbi" deliberately use greedy request parameters because
+# the current fast speculative engine is entered only for temperature<=0
+# or top_k==1. Adaptive Viterbi-MTP then performs multi-path search only at
+# selected low-confidence/repetitive positions inside the C runtime.
+OFFICIAL_SAMPLING_DEFAULTS = {
+    "temperature": 1.0,
+    "top_k": 20,
+    "top_p": 0.95,
+    "min_p": 0.0,
+    "presence_penalty": 0.0,
+}
+MTP_SAMPLING_DEFAULTS = {
+    "temperature": 0.0,
+    "top_k": 1,
+    "top_p": 0.0,
+    "min_p": 0.0,
+    "presence_penalty": 0.0,
+}
+SAMPLING_DEFAULTS = dict(OFFICIAL_SAMPLING_DEFAULTS)
+# Per-request sampling overrides are opt-in so server defaults remain
+# authoritative unless explicitly enabled.
+ALLOW_CLIENT_SAMPLING = os.environ.get(
+    "QWEN38_ALLOW_CLIENT_SAMPLING", "") not in ("", "0")
 RESPONSES_HONOR_EFFORT = os.environ.get(
     "QWEN38_RESPONSES_EFFORT", "") not in ("", "0")
 # Set to a directory to write each rendered prompt and its
@@ -724,23 +748,26 @@ class Handler(BaseHTTPRequestHandler):
         table = chat_tool_table(tools)
         rendered, system_turn = render_template(messages, thinking,
                                                 effort, tools)
-        # Per-request sampling passes straight through to the engine.
-        # Absent fields keep the engine defaults (greedy, which also
-        # enables lossless speculative decoding); a request that sets
-        # temperature > 0 gets true sampled decoding with top_k, top_p,
-        # min_p and presence_penalty honored.
-        sampling = {}
-        for source, target in (("temperature", "temperature"),
-                               ("top_k", "top_k"),
-                               ("top_p", "top_p"),
-                               ("min_p", "min_p"),
-                               ("presence_penalty", "presence_penalty"),
-                               ("max_tokens", "max_new"),
-                               ("max_completion_tokens", "max_new")):
+        # Start from the server-level Qwen3.8 defaults. Per-request sampling
+        # overrides are accepted only when QWEN38_ALLOW_CLIENT_SAMPLING=1.
+        sampling = dict(SAMPLING_DEFAULTS)
+        if ALLOW_CLIENT_SAMPLING:
+            for source, target in (("temperature", "temperature"),
+                                   ("top_k", "top_k"),
+                                   ("top_p", "top_p"),
+                                   ("min_p", "min_p"),
+                                   ("presence_penalty",
+                                    "presence_penalty")):
+                value = request.get(source)
+                if isinstance(value, (int, float)) and not isinstance(
+                        value, bool):
+                    sampling[target] = value
+        # Token budgets are safe to honor regardless of sampling mode.
+        for source in ("max_tokens", "max_completion_tokens"):
             value = request.get(source)
             if isinstance(value, (int, float)) and not isinstance(
                     value, bool):
-                sampling[target] = value
+                sampling["max_new"] = value
         identifier = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
         if request.get("stream"):
@@ -871,7 +898,20 @@ class Handler(BaseHTTPRequestHandler):
         table = flatten_tools(request.get("tools"))
         rendered, system_turn = render_responses_template(
             request, table, thinking, effort)
-        sampling = {}
+        # Responses clients (notably Codex) commonly omit sampling fields;
+        # use the same server-level Qwen3.8 defaults as chat.
+        sampling = dict(SAMPLING_DEFAULTS)
+        if ALLOW_CLIENT_SAMPLING:
+            for source, target in (("temperature", "temperature"),
+                                   ("top_k", "top_k"),
+                                   ("top_p", "top_p"),
+                                   ("min_p", "min_p"),
+                                   ("presence_penalty",
+                                    "presence_penalty")):
+                value = request.get(source)
+                if isinstance(value, (int, float)) and not isinstance(
+                        value, bool):
+                    sampling[target] = value
         budget = request.get("max_output_tokens")
         if isinstance(budget, int) and not isinstance(budget, bool):
             sampling["max_new"] = budget
@@ -1182,13 +1222,21 @@ def main():
                                                "") not in ("", "0"))
     parser.add_argument("--reasoning-effort",
                         default=os.environ.get("QWEN38_REASONING_EFFORT",
-                                               "low"),
+                                               "medium"),
                         choices=["low", "medium", "xhigh"])
-    parser.add_argument("--temperature", type=float,
-                        default=float(os.environ.get("QWEN38_TEMPERATURE",
-                                                     0)))
-    parser.add_argument("--top-k", type=int,
-                        default=int(os.environ.get("QWEN38_TOP_K", 1)))
+    parser.add_argument(
+        "--decode-mode",
+        default=os.environ.get("QWEN38_DECODE_MODE", "official"),
+        choices=["official", "mtp", "viterbi"],
+        help=("official: Qwen recommended sampling; mtp: fast greedy MTP; "
+              "viterbi: fast MTP with adaptive multi-path lattice search"))
+    # None means "take the selected decode-mode preset". Environment values
+    # and explicit CLI values override the preset.
+    parser.add_argument("--temperature", type=float, default=None)
+    parser.add_argument("--top-k", type=int, default=None)
+    parser.add_argument("--top-p", type=float, default=None)
+    parser.add_argument("--min-p", type=float, default=None)
+    parser.add_argument("--presence-penalty", type=float, default=None)
     parser.add_argument("--seed", type=int,
                         default=int(os.environ.get("QWEN38_SEED", 42)))
     arguments = parser.parse_args()
@@ -1197,6 +1245,55 @@ def main():
     LOG_PATH = stdout_path()
     THINKING_DEFAULT = bool(arguments.thinking)
     EFFORT_DEFAULT = arguments.reasoning_effort
+
+    preset = (OFFICIAL_SAMPLING_DEFAULTS if arguments.decode_mode == "official"
+              else MTP_SAMPLING_DEFAULTS)
+
+    def resolve_float(argument_value, env_name, key):
+        if argument_value is not None:
+            return float(argument_value)
+        if env_name in os.environ:
+            return float(os.environ[env_name])
+        return float(preset[key])
+
+    def resolve_int(argument_value, env_name, key):
+        if argument_value is not None:
+            return int(argument_value)
+        if env_name in os.environ:
+            return int(os.environ[env_name])
+        return int(preset[key])
+
+    arguments.temperature = resolve_float(
+        arguments.temperature, "QWEN38_TEMPERATURE", "temperature")
+    arguments.top_k = resolve_int(
+        arguments.top_k, "QWEN38_TOP_K", "top_k")
+    arguments.top_p = resolve_float(
+        arguments.top_p, "QWEN38_TOP_P", "top_p")
+    arguments.min_p = resolve_float(
+        arguments.min_p, "QWEN38_MIN_P", "min_p")
+    arguments.presence_penalty = resolve_float(
+        arguments.presence_penalty, "QWEN38_PRESENCE_PENALTY",
+        "presence_penalty")
+
+    if (arguments.decode_mode in ("mtp", "viterbi") and
+            arguments.temperature > 0.0 and arguments.top_k != 1):
+        raise SystemExit(
+            f"--decode-mode {arguments.decode_mode} requires the greedy "
+            "MTP request path (temperature<=0 or top_k=1). Remove the "
+            "sampling override, or use --decode-mode official.")
+
+    SAMPLING_DEFAULTS.update({
+        "temperature": arguments.temperature,
+        "top_k": arguments.top_k,
+        "top_p": arguments.top_p,
+        "min_p": arguments.min_p,
+        "presence_penalty": arguments.presence_penalty,
+    })
+    if arguments.decode_mode == "viterbi":
+        os.environ.setdefault("QWEN38_MTP_VITERBI", "1")
+    print("decode mode: "
+          f"{arguments.decode_mode}; sampling={SAMPLING_DEFAULTS}",
+          flush=True)
     ENGINE = Engine(arguments)
     ENGINE.start()
 
