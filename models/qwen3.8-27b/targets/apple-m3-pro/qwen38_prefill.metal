@@ -1506,7 +1506,10 @@ kernel void qwen38_prefill_flash_attention_qkreuse_pvreuse(
      * the work split is over positions (QK^T) and output dims (P.V).
      * Simdgroup g owns output dims {8g + 32k, k = 0..7} for every row. */
     threadgroup half sq[kFlashRows * 256];   /* query rows, pre-scaled 1/16 */
-    threadgroup float ss[kFlashRows * 128];  /* scores/probs: [row][position] */
+    /* This production path is fixed at block64. Keep only 64 score columns
+     * instead of the historical 128-column scratch used by the experimental
+     * block128 path. This trims 2 KiB of threadgroup storage. */
+    threadgroup float ss[kFlashRows * 64];   /* scores/probs: [row][position] */
     threadgroup float so[kFlashRows * 256];  /* O accumulator: [row][dim] */
 
     const uint q_head = group_id.x;
@@ -1525,12 +1528,14 @@ kernel void qwen38_prefill_flash_attention_qkreuse_pvreuse(
             : half(0.0f);
     }
 
-    /* Zero the O accumulator: each thread covers one element of every
-     * 32-dim window (k = 0..7), so all 256 dims of every row are zeroed;
-     * the four simdgroups write the same zeros redundantly. */
-    for (uint r = 0; r < kFlashRows; ++r) {
-        for (uint k = 0; k < 8; ++k)
-            so[r * 256 + 32 * k + lane] = 0.0f;
+    /* Zero O once: simdgroup g owns rows {g, g+4} for softmax state, so
+     * let it initialize exactly those two rows instead of having all four
+     * simdgroups redundantly zero all eight rows. */
+    const uint zero_r0 = sgitg;
+    const uint zero_r1 = sgitg + 4;
+    for (uint k = 0; k < 8; ++k) {
+        so[zero_r0 * 256 + 32 * k + lane] = 0.0f;
+        so[zero_r1 * 256 + 32 * k + lane] = 0.0f;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1581,8 +1586,8 @@ kernel void qwen38_prefill_flash_attention_qkreuse_pvreuse(
             simdgroup_load(mk1, pk1 + i * 8, 1024, 0, true);
             simdgroup_multiply_accumulate(mqk1, mq, mk1, mqk1);
         }
-        simdgroup_store(mqk0, ss + 8 * pos_tile0, 128, 0, false);
-        simdgroup_store(mqk1, ss + 8 * pos_tile1, 128, 0, false);
+        simdgroup_store(mqk0, ss + 8 * pos_tile0, 64, 0, false);
+        simdgroup_store(mqk1, ss + 8 * pos_tile1, 64, 0, false);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         /* Online softmax for this simdgroup's two rows, written with
@@ -1592,8 +1597,8 @@ kernel void qwen38_prefill_flash_attention_qkreuse_pvreuse(
         {
             const uint r = sgitg;
             const float old_m = m_a;
-            float2 s2 = float2(ss[r * 128 + 2 * lane],
-                               ss[r * 128 + 2 * lane + 1]);
+            float2 s2 = float2(ss[r * 64 + 2 * lane],
+                               ss[r * 64 + 2 * lane + 1]);
             {
                 const uint ctx = ctx_lo + sgitg;
                 if (block_start + 2 * lane >= ctx)
@@ -1602,19 +1607,24 @@ kernel void qwen38_prefill_flash_attention_qkreuse_pvreuse(
                     s2[1] = -INFINITY;
             }
             m_a = simd_max(max(old_m, max(s2[0], s2[1])));
-            const float alpha = exp(old_m - m_a);
+            /* If this block does not raise the running maximum, alpha is
+             * exactly 1.  Skip both exp(0) and the 256-dim O rescale. */
+            const bool rescale = m_a != old_m;
+            const float alpha = rescale ? exp(old_m - m_a) : 1.0f;
             const float2 p2 = exp(s2 - m_a);
             ssum_a = ssum_a * alpha + simd_sum(p2[0] + p2[1]);
-            ss[r * 128 + 2 * lane] = p2[0];
-            ss[r * 128 + 2 * lane + 1] = p2[1];
-            for (uint k = 0; k < 8; ++k)
-                so[r * 256 + 32 * k + lane] *= alpha;
+            ss[r * 64 + 2 * lane] = p2[0];
+            ss[r * 64 + 2 * lane + 1] = p2[1];
+            if (rescale) {
+                for (uint k = 0; k < 8; ++k)
+                    so[r * 256 + 32 * k + lane] *= alpha;
+            }
         }
         {
             const uint r = sgitg + 4;
             const float old_m = m_b;
-            float2 s2 = float2(ss[r * 128 + 2 * lane],
-                               ss[r * 128 + 2 * lane + 1]);
+            float2 s2 = float2(ss[r * 64 + 2 * lane],
+                               ss[r * 64 + 2 * lane + 1]);
             {
                 const uint ctx = ctx_lo + sgitg + 4;
                 if (block_start + 2 * lane >= ctx)
@@ -1623,13 +1633,16 @@ kernel void qwen38_prefill_flash_attention_qkreuse_pvreuse(
                     s2[1] = -INFINITY;
             }
             m_b = simd_max(max(old_m, max(s2[0], s2[1])));
-            const float alpha = exp(old_m - m_b);
+            const bool rescale = m_b != old_m;
+            const float alpha = rescale ? exp(old_m - m_b) : 1.0f;
             const float2 p2 = exp(s2 - m_b);
             ssum_b = ssum_b * alpha + simd_sum(p2[0] + p2[1]);
-            ss[r * 128 + 2 * lane] = p2[0];
-            ss[r * 128 + 2 * lane + 1] = p2[1];
-            for (uint k = 0; k < 8; ++k)
-                so[r * 256 + 32 * k + lane] *= alpha;
+            ss[r * 64 + 2 * lane] = p2[0];
+            ss[r * 64 + 2 * lane + 1] = p2[1];
+            if (rescale) {
+                for (uint k = 0; k < 8; ++k)
+                    so[r * 256 + 32 * k + lane] *= alpha;
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1656,7 +1669,7 @@ kernel void qwen38_prefill_flash_attention_qkreuse_pvreuse(
             for (uint cc = 0; cc < kFlashBlock / 16; ++cc) {
                 for (uint k = 0; k < 2; ++k) {
                     simdgroup_float8x8 vs;
-                    simdgroup_load(vs, ss + 16 * cc + 8 * k, 128);
+                    simdgroup_load(vs, ss + 16 * cc + 8 * k, 64);
                     const device half *pv = value_cache +
                         ((block_start + 16 * cc + 8 * k) * kPrefillKVHeads +
                          kv_head) * 256;
