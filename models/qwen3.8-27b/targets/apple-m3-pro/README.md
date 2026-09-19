@@ -53,7 +53,7 @@ make qwen38-m3-chat qwen38-tools qwen38-mtp-pack
 Download the exact revisions listed on the [model page](../../README.md), then compile the three weight shards and tokenizer:
 
 ```sh
-python compiler/qwen3.8-27b/apple-m3-pro/qwen38_q8_delta_quantize_all.py \
+python compiler/qwen3.8-27b/apple-m3-pro/hybrid/qwen38_q8_quantize_all.py \
     /path/to/qwen38-bf16/model.safetensors.index.json \
     ./tmp/q8_all
 
@@ -99,7 +99,7 @@ QWEN38_MODEL_DIR=/path/to/qwen38-runtime \
 OpenAI-compatible server:
 
 ```sh
-QWEN38_MTP=1 QWEN38_FLASH_PREFILL=1 QWEN38_KV_Q8=0 QWEN38_PREFILL_PROGRESS=1 QWEN38_PREFILL_MAX_CHUNK=128 python tools/qwen38_serve.py --model-dir ../models/qwen38-runtime-q8 --port 8080 --thinking --context 98304 --max-tokens 20480
+python tools/qwen38_serve.py --model-dir ../models/qwen38-runtime-q8 --port 8080 --thinking --context 98304 --max-tokens 20480
 # base URL: http://127.0.0.1:8199/v1
 ```
 
