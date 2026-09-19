@@ -635,10 +635,10 @@ ENGINE = None
 THINKING_DEFAULT = False
 EFFORT_DEFAULT = "medium"
 # Decode presets. "official" is the Qwen3.8 thinking-mode recommendation.
-# "mtp" and "viterbi" deliberately use greedy request parameters because
-# the current fast speculative engine is entered only for temperature<=0
-# or top_k==1. Adaptive Viterbi-MTP then performs multi-path search only at
-# selected low-confidence/repetitive positions inside the C runtime.
+# "mtp" keeps the historical greedy/output-lossless speculative path.
+# "viterbi" uses sampling-aware speculative MTP with temperature=1/top-k=10;
+# adaptive Viterbi then performs true depth-by-depth target-beam search at
+# selected low-confidence/repetitive positions.
 OFFICIAL_SAMPLING_DEFAULTS = {
     "temperature": 1.0,
     "top_k": 20,
@@ -649,6 +649,13 @@ OFFICIAL_SAMPLING_DEFAULTS = {
 MTP_SAMPLING_DEFAULTS = {
     "temperature": 0.0,
     "top_k": 1,
+    "top_p": 0.0,
+    "min_p": 0.0,
+    "presence_penalty": 0.0,
+}
+VITERBI_SAMPLING_DEFAULTS = {
+    "temperature": 1.0,
+    "top_k": 10,
     "top_p": 0.0,
     "min_p": 0.0,
     "presence_penalty": 0.0,
@@ -1228,8 +1235,10 @@ def main():
         "--decode-mode",
         default=os.environ.get("QWEN38_DECODE_MODE", "official"),
         choices=["official", "mtp", "viterbi"],
-        help=("official: Qwen recommended sampling; mtp: fast greedy MTP; "
-              "viterbi: fast MTP with adaptive multi-path lattice search"))
+        help=("official (default): sampled MTP + sampled Viterbi with Qwen "
+              "thinking defaults temp=1/top-k=20/top-p=0.95; mtp: fast "
+              "greedy MTP; viterbi: sampled MTP temp=1/top-k=10 plus "
+              "adaptive true target-beam Viterbi search"))
     # None means "take the selected decode-mode preset". Environment values
     # and explicit CLI values override the preset.
     parser.add_argument("--temperature", type=float, default=None)
@@ -1246,8 +1255,12 @@ def main():
     THINKING_DEFAULT = bool(arguments.thinking)
     EFFORT_DEFAULT = arguments.reasoning_effort
 
-    preset = (OFFICIAL_SAMPLING_DEFAULTS if arguments.decode_mode == "official"
-              else MTP_SAMPLING_DEFAULTS)
+    if arguments.decode_mode == "official":
+        preset = OFFICIAL_SAMPLING_DEFAULTS
+    elif arguments.decode_mode == "viterbi":
+        preset = VITERBI_SAMPLING_DEFAULTS
+    else:
+        preset = MTP_SAMPLING_DEFAULTS
 
     def resolve_float(argument_value, env_name, key):
         if argument_value is not None:
@@ -1275,13 +1288,6 @@ def main():
         arguments.presence_penalty, "QWEN38_PRESENCE_PENALTY",
         "presence_penalty")
 
-    if (arguments.decode_mode in ("mtp", "viterbi") and
-            arguments.temperature > 0.0 and arguments.top_k != 1):
-        raise SystemExit(
-            f"--decode-mode {arguments.decode_mode} requires the greedy "
-            "MTP request path (temperature<=0 or top_k=1). Remove the "
-            "sampling override, or use --decode-mode official.")
-
     SAMPLING_DEFAULTS.update({
         "temperature": arguments.temperature,
         "top_k": arguments.top_k,
@@ -1289,7 +1295,7 @@ def main():
         "min_p": arguments.min_p,
         "presence_penalty": arguments.presence_penalty,
     })
-    if arguments.decode_mode == "viterbi":
+    if arguments.decode_mode in ("official", "viterbi"):
         os.environ.setdefault("QWEN38_MTP_VITERBI", "1")
     print("decode mode: "
           f"{arguments.decode_mode}; sampling={SAMPLING_DEFAULTS}",

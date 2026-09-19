@@ -464,7 +464,7 @@ int main(int argc, char **argv) {
                                      error, sizeof(error)) == 0) {
             mtp = 1;
             fprintf(stderr, "MTP speculative decoding active "
-                            "(greedy, output-lossless).\n");
+                            "(greedy lossless + sampled top-k/top-p p/q verify).\n");
         } else if (mtp_env != NULL) {
             fprintf(stderr, "MTP requested but unavailable: %s\n", error);
         }
@@ -823,7 +823,18 @@ int main(int argc, char **argv) {
         qwen38_sampler_begin(&sampler, QWEN38_TOKENIZER_VOCAB);
         int greedy_request = request.temperature <= 0.0f ||
                              request.top_k == 1;
-        int use_mtp = mtp && greedy_request;
+        int sampled_mtp_request =
+            request.temperature > 0.0f && request.top_k > 1 &&
+            request.top_k <= 64 &&
+            request.top_p >= 0.0f && request.top_p <= 1.0f &&
+            request.min_p <= 0.0f &&
+            request.presence_penalty == 0.0f;
+        int use_mtp = mtp && (greedy_request || sampled_mtp_request);
+        if (mtp && !greedy_request && !sampled_mtp_request)
+            fprintf(stderr,
+                    "MTP sampling supports temperature+top-k+top-p "
+                    "(min_p/presence penalty must be zero); falling back "
+                    "to ordinary sampling for this request.\n");
         uint32_t generated_count = 0;
         size_t visible_count = 0;
         stream_text_reset(&stream);
@@ -896,11 +907,22 @@ int main(int argc, char **argv) {
                     double best_score = 0.0;
                     double runner_score = 0.0;
                     uint32_t chosen_rank = 0;
-                    mtp_status = qwen38_m3_model_mtp_lattice_step(
-                        model, &pending, &mtp_position, step_emitted,
-                        &step_count, viterbi_beam, viterbi_depth,
-                        &best_score, &runner_score, &chosen_rank,
-                        error, sizeof(error));
+                    if (sampled_mtp_request) {
+                        mtp_status =
+                            qwen38_m3_model_mtp_viterbi_sample_step(
+                                model, &pending, &mtp_position,
+                                step_emitted, &step_count, viterbi_beam,
+                                viterbi_depth, request.temperature,
+                                request.top_k, request.top_p, &sampler.state,
+                                &best_score, &runner_score, &chosen_rank,
+                                error, sizeof(error));
+                    } else {
+                        mtp_status = qwen38_m3_model_mtp_lattice_step(
+                            model, &pending, &mtp_position, step_emitted,
+                            &step_count, viterbi_beam, viterbi_depth,
+                            &best_score, &runner_score, &chosen_rank,
+                            error, sizeof(error));
+                    }
                     if (mtp_status == 0) {
                         ++viterbi_steps;
                         if (trigger_period != 0 || trigger_run)
@@ -908,14 +930,21 @@ int main(int argc, char **argv) {
                         next_viterbi_check =
                             generated_count + viterbi_cooldown;
                         fprintf(stderr,
-                            "[viterbi-mtp] beam %u depth %u rank %u "
+                            "[viterbi-mtp%s] beam %u depth %u rank %u "
                             "gap %.3f score %.3f margin %.3f%s%s\n",
+                            sampled_mtp_request ? "-sample" : "",
                             viterbi_beam, viterbi_depth, chosen_rank,
                             confidence_gap, best_score,
                             best_score - runner_score,
                             trigger_period != 0 ? " repetition" : "",
                             trigger_run ? " run" : "");
                     }
+                } else if (sampled_mtp_request) {
+                    mtp_status = qwen38_m3_model_mtp_sample_step(
+                        model, &pending, &mtp_position, step_emitted,
+                        &step_count, &step_accepted, request.temperature,
+                        request.top_k, request.top_p, &sampler.state, error,
+                        sizeof(error));
                 } else {
                     mtp_status = qwen38_m3_model_mtp_step(
                         model, &pending, &mtp_position, step_emitted,
@@ -934,6 +963,7 @@ int main(int argc, char **argv) {
                         history[history_count++] = step_emitted[i];
                 for (uint32_t i = 0; i < step_count && !done; ++i) {
                     generated[generated_count++] = step_emitted[i];
+                    qwen38_sampler_note(&sampler, step_emitted[i]);
                     if (step_emitted[i] == QWEN38_END_OF_TEXT ||
                         step_emitted[i] == QWEN38_IM_END ||
                         generated_count >= budget)

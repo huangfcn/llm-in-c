@@ -137,6 +137,47 @@ int qwen38_m3_model_mtp_step(
     char *error_message,
     size_t error_message_capacity);
 
+/* Sampling-aware speculative MTP for temperature + top-k + top-p requests.
+ * Draft successors are sampled from the MTP proposal and accepted with
+ * min(1,p/q) against the batched target verification.  On rejection the
+ * next pending token is drawn from normalized max(p-q,0). */
+int qwen38_m3_model_mtp_sample_step(
+    qwen38_m3_model *model,
+    uint32_t *current_token,
+    uint32_t *position,
+    uint32_t emitted[8],
+    uint32_t *emitted_count,
+    int *accepted,
+    float temperature,
+    uint32_t top_k,
+    float top_p,
+    uint64_t *rng_state,
+    char *error_message,
+    size_t error_message_capacity);
+
+/* True depth-by-depth target beam for sampled MTP mode.  The already-sampled
+ * current token is fixed as the root; top-k target successors are expanded
+ * at every depth and pruned back to beam_width by cumulative target log
+ * probability.  This is intentionally occasional because it performs
+ * multiple target forwards. */
+int qwen38_m3_model_mtp_viterbi_sample_step(
+    qwen38_m3_model *model,
+    uint32_t *current_token,
+    uint32_t *position,
+    uint32_t emitted[8],
+    uint32_t *emitted_count,
+    uint32_t beam_width,
+    uint32_t depth,
+    float temperature,
+    uint32_t top_k,
+    float top_p,
+    uint64_t *rng_state,
+    double *best_score,
+    double *runner_score,
+    uint32_t *chosen_rank,
+    char *error_message,
+    size_t error_message_capacity);
+
 
 /* Adaptive Viterbi-style multi-path lookahead. Requires target logits from a
  * preceding MTP step. The top beam_width pending-token hypotheses are each

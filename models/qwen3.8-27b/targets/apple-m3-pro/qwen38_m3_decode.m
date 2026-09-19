@@ -442,6 +442,16 @@ static int pinned_sha(const char *sha) {
            memcmp(sha, QWEN38_M3_EXPECTED_MTP_SHA256, 64) == 0;
 }
 
+/* Folder-built images (packed from q4_all/q8_all planes) have no source shard
+ * to hash, so their SHA fields are all zero. Accept that as a valid, unpinned
+ * source -- every other structural check still applies, and
+ * verify_packed_images.py is the byte-level integrity gate for these. */
+static int sha_is_zeroed(const char *sha) {
+    for (int i = 0; i < QWEN38_M3_SOURCE_SHA256_LENGTH; ++i)
+        if (sha[i] != '\0') return 0;
+    return 1;
+}
+
 static id<MTLComputePipelineState>
 decode_pipeline(Q38DecodeRuntime *runtime, NSString *name, NSError **error) {
     id<MTLFunction> function = [runtime->library newFunctionWithName:name];
@@ -500,8 +510,10 @@ static int validate_delta_header(const qwen38_m3_image_header *h,
         (h->delta_input_precision != 0 &&
          h->delta_input_precision != 1) ||
         h->delta_output_precision != 0 ||
-        !pinned_sha(h->source_sha256) ||
+        (!sha_is_zeroed(h->source_sha256) &&
+         !pinned_sha(h->source_sha256)) ||
         (h->mlp_source_sha256[0] != '\0' &&
+         !sha_is_zeroed(h->mlp_source_sha256) &&
          !pinned_sha(h->mlp_source_sha256))) return -1;
     uint64_t end = h->delta_output_metadata_offset +
                    h->delta_output_metadata_bytes;
@@ -521,7 +533,8 @@ static int validate_attention_header(
         h->input_rows != 14336 || h->input_groups_per_row != 80 ||
         h->output_rows != 5120 || h->output_groups_per_row != 96 ||
         h->constants_f32_count != 10752 ||
-        !pinned_sha(h->source_sha256)) return -1;
+        (!sha_is_zeroed(h->source_sha256) &&
+         !pinned_sha(h->source_sha256))) return -1;
     return h->attention_output_metadata_offset +
            h->attention_output_metadata_bytes == length ? 0 : -1;
 }
@@ -533,10 +546,12 @@ static int validate_global_header(const qwen38_m3_global_image_header *h,
         h->vocab_size != QWEN38_VOCAB_SIZE ||
         h->hidden_size != 5120 || h->group_size != 64 ||
         h->constants_f32_count != 5120 ||
-        memcmp(h->embedding_source_sha256,
-               QWEN38_M3_EXPECTED_SOURCE_SHA256, 64) != 0 ||
-        memcmp(h->lm_head_source_sha256,
-               QWEN38_M3_EXPECTED_SOURCE_SHA256_3, 64) != 0)
+        (!sha_is_zeroed(h->embedding_source_sha256) &&
+         memcmp(h->embedding_source_sha256,
+                QWEN38_M3_EXPECTED_SOURCE_SHA256, 64) != 0) ||
+        (!sha_is_zeroed(h->lm_head_source_sha256) &&
+         memcmp(h->lm_head_source_sha256,
+                QWEN38_M3_EXPECTED_SOURCE_SHA256_3, 64) != 0))
         return -1;
     return h->constants_offset + h->constants_bytes == length ? 0 : -1;
 }
@@ -3154,6 +3169,160 @@ static uint32_t topk_f32(const float *values, uint32_t count, uint32_t k,
     return k;
 }
 
+
+/* Sampling helpers for speculative decoding with temperature + top-k +
+ * top-p.  The same filtered distribution is used for MTP proposal q, target
+ * p, residual correction, Viterbi expansion, and post-Viterbi sampling.
+ * Keeping the distribution tiny (<=64 entries) means the acceptance/
+ * correction math never scans the full vocabulary after the target and
+ * draft heads have produced logits. */
+enum { Q38_MTP_SAMPLE_TOPK_MAX = 64 };
+
+typedef struct {
+    uint32_t count;
+    uint32_t ids[Q38_MTP_SAMPLE_TOPK_MAX];
+    double probabilities[Q38_MTP_SAMPLE_TOPK_MAX];
+} q38_mtp_distribution;
+
+static uint64_t q38_mtp_random_u64(uint64_t *state) {
+    uint64_t value = state != NULL ? *state : 0;
+    if (value == 0) value = 0x9e3779b97f4a7c15ull;
+    value ^= value >> 12;
+    value ^= value << 25;
+    value ^= value >> 27;
+    if (state != NULL) *state = value;
+    return value * 0x2545f4914f6cdd1dull;
+}
+
+static double q38_mtp_uniform(uint64_t *state) {
+    return (double)(q38_mtp_random_u64(state) >> 11) *
+           (1.0 / 9007199254740992.0);
+}
+
+static uint32_t q38_mtp_distribution_from_logits(
+    const float *logits, uint32_t vocab, float temperature, uint32_t top_k,
+    float top_p, q38_mtp_distribution *out) {
+    if (out == NULL || logits == NULL || vocab == 0) return 0;
+    if (top_k == 0 || top_k > Q38_MTP_SAMPLE_TOPK_MAX)
+        top_k = Q38_MTP_SAMPLE_TOPK_MAX;
+    if (top_k > vocab) top_k = vocab;
+    if (temperature <= 0.0f || top_k <= 1) {
+        out->count = 1;
+        out->ids[0] = argmax_f32(logits, vocab);
+        out->probabilities[0] = 1.0;
+        return 1;
+    }
+
+    float scores[Q38_MTP_SAMPLE_TOPK_MAX];
+    for (uint32_t i = 0; i < top_k; ++i) {
+        out->ids[i] = 0;
+        scores[i] = -FLT_MAX;
+    }
+    for (uint32_t id = 0; id < vocab; ++id) {
+        float value = logits[id];
+        if (value <= scores[top_k - 1]) continue;
+        uint32_t pos = top_k - 1;
+        while (pos != 0 && value > scores[pos - 1]) {
+            scores[pos] = scores[pos - 1];
+            out->ids[pos] = out->ids[pos - 1];
+            --pos;
+        }
+        scores[pos] = value;
+        out->ids[pos] = id;
+    }
+
+    double maximum = (double)scores[0] / (double)temperature;
+    double sum = 0.0;
+    for (uint32_t i = 0; i < top_k; ++i) {
+        double weight = exp((double)scores[i] / (double)temperature - maximum);
+        out->probabilities[i] = weight;
+        sum += weight;
+    }
+    if (!(sum > 0.0) || !isfinite(sum)) {
+        out->count = 1;
+        out->probabilities[0] = 1.0;
+        return 1;
+    }
+    for (uint32_t i = 0; i < top_k; ++i)
+        out->probabilities[i] /= sum;
+
+    /* Apply nucleus filtering after top-k filtering.  scores[] and therefore
+     * probabilities[] are already in descending order.  Keep the smallest
+     * prefix whose cumulative probability reaches top_p, then renormalize.
+     * top_p <= 0 or >= 1 means no nucleus filtering, matching the server's
+     * disabled/default convention. */
+    uint32_t keep = top_k;
+    if (top_p > 0.0f && top_p < 1.0f) {
+        double cumulative = 0.0;
+        keep = 0;
+        while (keep < top_k) {
+            cumulative += out->probabilities[keep];
+            ++keep;
+            if (cumulative >= (double)top_p) break;
+        }
+        if (keep == 0) keep = 1;
+        double kept_sum = 0.0;
+        for (uint32_t i = 0; i < keep; ++i)
+            kept_sum += out->probabilities[i];
+        if (!(kept_sum > 0.0) || !isfinite(kept_sum)) {
+            out->count = 1;
+            out->probabilities[0] = 1.0;
+            return 1;
+        }
+        for (uint32_t i = 0; i < keep; ++i)
+            out->probabilities[i] /= kept_sum;
+    }
+    out->count = keep;
+    return keep;
+}
+
+static double q38_mtp_probability(const q38_mtp_distribution *dist,
+                                  uint32_t token) {
+    if (dist == NULL) return 0.0;
+    for (uint32_t i = 0; i < dist->count; ++i)
+        if (dist->ids[i] == token) return dist->probabilities[i];
+    return 0.0;
+}
+
+static uint32_t q38_mtp_sample_distribution(
+    const q38_mtp_distribution *dist, uint64_t *state) {
+    if (dist == NULL || dist->count == 0) return 0;
+    double threshold = q38_mtp_uniform(state);
+    double cumulative = 0.0;
+    for (uint32_t i = 0; i < dist->count; ++i) {
+        cumulative += dist->probabilities[i];
+        if (threshold <= cumulative) return dist->ids[i];
+    }
+    return dist->ids[dist->count - 1];
+}
+
+/* Standard speculative-sampling correction distribution:
+ * normalize max(p - q, 0).  Because p and q are both top-k distributions,
+ * only p's support can have positive residual mass. */
+static uint32_t q38_mtp_sample_residual(
+    const q38_mtp_distribution *p, const q38_mtp_distribution *q,
+    uint64_t *state) {
+    if (p == NULL || p->count == 0) return 0;
+    double residual[Q38_MTP_SAMPLE_TOPK_MAX];
+    double sum = 0.0;
+    for (uint32_t i = 0; i < p->count; ++i) {
+        double value = p->probabilities[i] -
+                       q38_mtp_probability(q, p->ids[i]);
+        if (value < 0.0) value = 0.0;
+        residual[i] = value;
+        sum += value;
+    }
+    if (!(sum > 1e-15))
+        return q38_mtp_sample_distribution(p, state);
+    double threshold = q38_mtp_uniform(state) * sum;
+    double cumulative = 0.0;
+    for (uint32_t i = 0; i < p->count; ++i) {
+        cumulative += residual[i];
+        if (threshold <= cumulative) return p->ids[i];
+    }
+    return p->ids[p->count - 1];
+}
+
 int qwen38_m3_model_mtp_open(
     qwen38_m3_model *model, const char *layer_image_path,
     const char *extras_image_path, char *error_message,
@@ -3566,6 +3735,198 @@ int qwen38_m3_model_mtp_step(
 }
 
 
+/* Sampling-aware speculative MTP.
+ *
+ * The pending token was sampled from the target distribution by the caller.
+ * Draft successors are sampled from the MTP proposal q (temperature/top-k),
+ * then the existing single batched target verify supplies p for every draft
+ * position.  Draft i is accepted with min(1, p(x_i)/q(x_i)); the first
+ * rejection hands a token sampled from normalized max(p-q,0) back as the
+ * next pending token.  This is the standard speculative-sampling rule and
+ * therefore preserves the target temperature/top-k/top-p policy while retaining
+ * the one-verify MTP architecture.
+ *
+ * Supports temperature + top-k + top-p with exact p/q correction. */
+int qwen38_m3_model_mtp_sample_step(
+    qwen38_m3_model *model, uint32_t *current_token, uint32_t *position,
+    uint32_t emitted[8], uint32_t *emitted_count, int *accepted,
+    float temperature, uint32_t top_k, float top_p, uint64_t *rng_state,
+    char *error_message, size_t error_message_capacity) {
+    if (model == NULL || model->runtime == NULL || current_token == NULL ||
+        position == NULL || emitted == NULL || emitted_count == NULL ||
+        accepted == NULL || rng_state == NULL || temperature <= 0.0f ||
+        top_k <= 1 || top_k > Q38_MTP_SAMPLE_TOPK_MAX) {
+        decode_error(error_message, error_message_capacity,
+                     @"invalid sampled MTP arguments");
+        return 1;
+    }
+    Q38DecodeRuntime *r = (__bridge Q38DecodeRuntime *)model->runtime;
+    model->mtp_next_logits_valid = 0;
+    if (r->mtp_layer == nil) {
+        decode_error(error_message, error_message_capacity,
+                     @"MTP images are not loaded");
+        return 1;
+    }
+
+    uint32_t j = *position;
+    uint32_t depth = r->mtp_depth;
+    if (depth == 0) {
+        float ema = model->mtp_accept_ema;
+        depth = ema > 0.85f ? 7 :
+                (ema > 0.70f ? 5 :
+                 (ema > 0.55f ? 3 : (ema > 0.40f ? 2 : 1)));
+    }
+    while (depth > 1 && (uint64_t)j + depth + 1 > r->capacity) --depth;
+    if ((uint64_t)j + depth + 1 > r->capacity) {
+        decode_error(error_message, error_message_capacity,
+                     @"sampled MTP exceeds context capacity");
+        return 1;
+    }
+
+    id<MTLBuffer> hidden = model->mtp_hidden_source == 0 ?
+        r->final_normalized : r->p_post_normalized;
+    NSUInteger hidden_offset = model->mtp_hidden_source >= 1 ?
+        (NSUInteger)(model->mtp_hidden_source - 1) * 5120 *
+            sizeof(uint16_t) : 0;
+
+    uint32_t tokens[8] = {0};
+    q38_mtp_distribution proposals[7];
+    tokens[0] = *current_token;
+
+    double phase0 = decode_seconds();
+    /* Sampling needs each draft distribution on the CPU, so v1 intentionally
+     * uses one synchronous MTP pass per draft instead of the GPU-argmax fused
+     * command buffer.  The expensive target verification remains batched. */
+    for (uint32_t i = 0; i < depth; ++i) {
+        int draft_status = run_mtp_pass(
+            model, 1, &tokens[i], j + i,
+            i == 0 ? hidden : r->final_normalized,
+            i == 0 ? hidden_offset : 0, 1, 0, NULL,
+            error_message, error_message_capacity);
+        if (draft_status != 0) return draft_status;
+        if (q38_mtp_distribution_from_logits(
+                (const float *)r->mtp_logits.contents,
+                QWEN38_VOCAB_SIZE, temperature, top_k, top_p,
+                &proposals[i]) == 0) {
+            decode_error(error_message, error_message_capacity,
+                         @"cannot build MTP proposal distribution");
+            return 1;
+        }
+        tokens[i + 1] =
+            q38_mtp_sample_distribution(&proposals[i], rng_state);
+    }
+
+    int status = model_forward_batch(model, tokens, depth + 1, j, 1,
+                                     error_message,
+                                     error_message_capacity);
+    if (status != 0) return status;
+    if (getenv("QWEN38_MTP_DEBUG") != NULL)
+        fprintf(stderr, "[mtp-sample-time] depth %u draft+verify %.1f ms\n",
+                depth, (decode_seconds() - phase0) * 1000.0);
+
+    const float *target_logits = r->p_logits2.contents;
+    uint32_t accepted_count = 0;
+    q38_mtp_distribution rejection_p = {0};
+    for (; accepted_count < depth; ++accepted_count) {
+        q38_mtp_distribution p_dist;
+        if (q38_mtp_distribution_from_logits(
+                target_logits + (size_t)accepted_count * QWEN38_VOCAB_SIZE,
+                QWEN38_VOCAB_SIZE, temperature, top_k, top_p, &p_dist) == 0) {
+            decode_error(error_message, error_message_capacity,
+                         @"cannot build target sampling distribution");
+            return 1;
+        }
+        uint32_t draft = tokens[accepted_count + 1];
+        double p_draft = q38_mtp_probability(&p_dist, draft);
+        double q_draft = q38_mtp_probability(&proposals[accepted_count],
+                                             draft);
+        double ratio = q_draft > 0.0 ? p_draft / q_draft : 1.0;
+        if (ratio > 1.0) ratio = 1.0;
+        if (q38_mtp_uniform(rng_state) <= ratio)
+            continue;
+        rejection_p = p_dist;
+        break;
+    }
+
+    uint32_t emit_count = accepted_count + 1; /* pending + accepted drafts */
+    uint32_t next_logit_row = accepted_count;
+    uint32_t next_pending = 0;
+    int used_rollback = accepted_count != depth;
+
+    if (accepted_count == depth) {
+        q38_mtp_distribution final_p;
+        if (q38_mtp_distribution_from_logits(
+                target_logits + (size_t)depth * QWEN38_VOCAB_SIZE,
+                QWEN38_VOCAB_SIZE, temperature, top_k, top_p, &final_p) == 0) {
+            decode_error(error_message, error_message_capacity,
+                         @"cannot build final target distribution");
+            return 1;
+        }
+        next_pending = q38_mtp_sample_distribution(&final_p, rng_state);
+        next_logit_row = depth;
+    } else {
+        /* Restore target state to the last emitted token.  The normal
+         * production MMA path uses replay-free factor checkpoints. */
+        if (r->prefill_mma_level != 0) {
+            status = rollback_to_accept(model, emit_count,
+                                        error_message,
+                                        error_message_capacity);
+            if (status != 0) return status;
+        } else {
+            gdn_state_copy(r, 1);
+            status = model_forward_batch(model, tokens, emit_count, j, 0,
+                                         error_message,
+                                         error_message_capacity);
+            if (status != 0) return status;
+            target_logits = r->p_logits2.contents;
+            if (q38_mtp_distribution_from_logits(
+                    target_logits + (size_t)accepted_count *
+                        QWEN38_VOCAB_SIZE,
+                    QWEN38_VOCAB_SIZE, temperature, top_k, top_p,
+                    &rejection_p) == 0) {
+                decode_error(error_message, error_message_capacity,
+                             @"cannot rebuild rejection distribution");
+                return 1;
+            }
+        }
+        next_pending = q38_mtp_sample_residual(
+            &rejection_p, &proposals[accepted_count], rng_state);
+    }
+
+    for (uint32_t i = 0; i < emit_count; ++i)
+        emitted[i] = tokens[i];
+    *emitted_count = emit_count;
+    *accepted = (int)accepted_count;
+
+    /* Rebuild confirmed MTP cache rows from the target's true hidden states.
+     * On a rejection only accepted draft successors need refresh. */
+    if (emit_count > 1) {
+        status = run_mtp_pass(model, emit_count - 1, emitted + 1, j + 1,
+                              r->p_post_normalized, 0, 0, 0, NULL,
+                              error_message, error_message_capacity);
+        if (status != 0) return status;
+    }
+
+    *current_token = next_pending;
+    *position = j + emit_count;
+    model->mtp_hidden_source = (int)emit_count;
+    model->mtp_next_logit_row = next_logit_row;
+    model->mtp_next_logits_valid = 1;
+
+    if (r->mtp_depth == 0) {
+        for (uint32_t i = 0; i < depth && i <= accepted_count; ++i)
+            model->mtp_accept_ema = 0.85f * model->mtp_accept_ema +
+                (i < accepted_count ? 0.15f : 0.0f);
+    }
+    if (getenv("QWEN38_MTP_DEBUG") != NULL)
+        fprintf(stderr,
+                "[mtp-sample] depth %u accepted %u%s next %u\n",
+                depth, accepted_count,
+                used_rollback ? " reject" : " full", next_pending);
+    return 0;
+}
+
+
 /*
  * Adaptive Viterbi-style MTP lattice, v1.
  *
@@ -3751,6 +4112,200 @@ int qwen38_m3_model_mtp_lattice_step(
     *position = j + depth + 1;
     model->mtp_hidden_source = (int)(depth + 1);
     model->mtp_next_logit_row = depth;
+    model->mtp_next_logits_valid = 1;
+
+    if (best_score_out != NULL) *best_score_out = best_score;
+    if (runner_score_out != NULL) *runner_score_out = runner_score;
+    if (chosen_rank_out != NULL) *chosen_rank_out = best_rank;
+    return 0;
+}
+
+
+/* True target-beam Viterbi search for sampled MTP mode.
+ *
+ * Unlike lattice v1, which branches only at the root and greedily drafts the
+ * rest, this expands the target model's top-k successors at every depth and
+ * prunes back to beam_width after each layer of the tree.  The caller's
+ * already-sampled pending token is fixed as the root.  Because this requires
+ * multiple target forwards it remains an occasional adaptive search path;
+ * normal sampled generation uses qwen38_m3_model_mtp_sample_step above. */
+int qwen38_m3_model_mtp_viterbi_sample_step(
+    qwen38_m3_model *model,
+    uint32_t *current_token,
+    uint32_t *position,
+    uint32_t emitted[8],
+    uint32_t *emitted_count,
+    uint32_t beam_width,
+    uint32_t depth,
+    float temperature,
+    uint32_t top_k,
+    float top_p,
+    uint64_t *rng_state,
+    double *best_score_out,
+    double *runner_score_out,
+    uint32_t *chosen_rank_out,
+    char *error_message,
+    size_t error_message_capacity) {
+    if (model == NULL || model->runtime == NULL || current_token == NULL ||
+        position == NULL || emitted == NULL || emitted_count == NULL ||
+        rng_state == NULL || temperature <= 0.0f || top_k <= 1 ||
+        top_k > Q38_MTP_SAMPLE_TOPK_MAX) {
+        decode_error(error_message, error_message_capacity,
+                     @"invalid sampled Viterbi-MTP arguments");
+        return 1;
+    }
+    Q38DecodeRuntime *r = (__bridge Q38DecodeRuntime *)model->runtime;
+    model->mtp_next_logits_valid = 0;
+    if (r->mtp_layer == nil) {
+        decode_error(error_message, error_message_capacity,
+                     @"MTP images are not loaded");
+        return 1;
+    }
+    if (beam_width < 2) beam_width = 2;
+    if (beam_width > 8) beam_width = 8;
+    if (depth < 1) depth = 1;
+    if (depth > 7) depth = 7;
+    uint32_t j = *position;
+    while (depth > 1 && (uint64_t)j + depth + 1 > r->capacity) --depth;
+    if ((uint64_t)j + depth + 1 > r->capacity) {
+        decode_error(error_message, error_message_capacity,
+                     @"sampled Viterbi-MTP exceeds context capacity");
+        return 1;
+    }
+
+    typedef struct {
+        uint32_t tokens[8];
+        uint32_t length;
+        uint32_t first_rank;
+        double score;
+    } q38_viterbi_node;
+
+    q38_viterbi_node beam[8];
+    q38_viterbi_node candidates[8 * Q38_MTP_SAMPLE_TOPK_MAX];
+    uint32_t beam_count = 1;
+    memset(beam, 0, sizeof(beam));
+    beam[0].tokens[0] = *current_token;
+    beam[0].length = 1;
+    beam[0].first_rank = 0;
+    beam[0].score = 0.0;
+
+    /* Preserve the target hidden state immediately before the sampled root.
+     * Branch replays overwrite the shared post-normalized workspace, but the
+     * MTP layer still needs this exact hidden to rebuild its KV row at j. */
+    id<MTLBuffer> hidden_source = model->mtp_hidden_source == 0 ?
+        r->final_normalized : r->p_post_normalized;
+    NSUInteger hidden_offset = model->mtp_hidden_source >= 1 ?
+        (NSUInteger)(model->mtp_hidden_source - 1) * 5120 *
+            sizeof(uint16_t) : 0;
+    uint16_t saved_hidden[5120];
+    memcpy(saved_hidden,
+           (const unsigned char *)hidden_source.contents + hidden_offset,
+           sizeof(saved_hidden));
+
+    /* Common-prefix GDN state. Attention rows at j.. are branch-local and are
+     * safely overwritten on every replay. */
+    gdn_state_copy(r, 0);
+
+    for (uint32_t level = 0; level < depth; ++level) {
+        uint32_t candidate_count = 0;
+        for (uint32_t b = 0; b < beam_count; ++b) {
+            gdn_state_copy(r, 1);
+            int status = model_forward_batch(
+                model, beam[b].tokens, beam[b].length, j, 0,
+                error_message, error_message_capacity);
+            if (status != 0) {
+                gdn_state_copy(r, 1);
+                return status;
+            }
+            const float *row = (const float *)r->p_logits2.contents +
+                (size_t)(beam[b].length - 1) * QWEN38_VOCAB_SIZE;
+            q38_mtp_distribution dist;
+            if (q38_mtp_distribution_from_logits(
+                    row, QWEN38_VOCAB_SIZE, temperature, top_k, top_p,
+                    &dist) == 0) {
+                gdn_state_copy(r, 1);
+                decode_error(error_message, error_message_capacity,
+                             @"cannot build Viterbi target distribution");
+                return 1;
+            }
+            for (uint32_t k = 0; k < dist.count; ++k) {
+                if (candidate_count >=
+                    8 * Q38_MTP_SAMPLE_TOPK_MAX) break;
+                q38_viterbi_node node = beam[b];
+                if (node.length >= 8) break;
+                node.tokens[node.length++] = dist.ids[k];
+                node.score += log(dist.probabilities[k]);
+                if (level == 0) node.first_rank = k;
+                candidates[candidate_count++] = node;
+            }
+        }
+        if (candidate_count == 0) {
+            gdn_state_copy(r, 1);
+            decode_error(error_message, error_message_capacity,
+                         @"sampled Viterbi-MTP produced no candidates");
+            return 1;
+        }
+
+        /* Keep the B highest cumulative target-log-probability paths. */
+        uint32_t keep = candidate_count < beam_width ?
+            candidate_count : beam_width;
+        for (uint32_t out = 0; out < keep; ++out) {
+            uint32_t best = out;
+            for (uint32_t i = out + 1; i < candidate_count; ++i)
+                if (candidates[i].score > candidates[best].score)
+                    best = i;
+            q38_viterbi_node tmp = candidates[out];
+            candidates[out] = candidates[best];
+            candidates[best] = tmp;
+            beam[out] = candidates[out];
+        }
+        beam_count = keep;
+    }
+
+    double best_score = beam[0].score;
+    double runner_score = beam_count > 1 ? beam[1].score : -HUGE_VAL;
+    uint32_t best_rank = beam[0].first_rank;
+
+    /* Commit only the winning path from the untouched common prefix.  First
+     * rebuild the MTP KV row for the fixed root from the exact pre-root hidden
+     * state; target-only branch exploration never touched the MTP layer. */
+    gdn_state_copy(r, 1);
+    memcpy(r->final_normalized.contents, saved_hidden, sizeof(saved_hidden));
+    int status = run_mtp_pass(
+        model, 1, &beam[0].tokens[0], j, r->final_normalized, 0,
+        0, 0, NULL, error_message, error_message_capacity);
+    if (status != 0) return status;
+    status = model_forward_batch(
+        model, beam[0].tokens, beam[0].length, j, 0,
+        error_message, error_message_capacity);
+    if (status != 0) return status;
+
+    if (beam[0].length > 1) {
+        status = run_mtp_pass(
+            model, beam[0].length - 1, beam[0].tokens + 1, j + 1,
+            r->p_post_normalized, 0, 0, 0, NULL,
+            error_message, error_message_capacity);
+        if (status != 0) return status;
+    }
+
+    for (uint32_t i = 0; i < beam[0].length; ++i)
+        emitted[i] = beam[0].tokens[i];
+    *emitted_count = beam[0].length;
+
+    const float *final_row = (const float *)r->p_logits2.contents +
+        (size_t)(beam[0].length - 1) * QWEN38_VOCAB_SIZE;
+    q38_mtp_distribution next_dist;
+    if (q38_mtp_distribution_from_logits(
+            final_row, QWEN38_VOCAB_SIZE, temperature, top_k, top_p,
+            &next_dist) == 0) {
+        decode_error(error_message, error_message_capacity,
+                     @"cannot build post-Viterbi target distribution");
+        return 1;
+    }
+    *current_token = q38_mtp_sample_distribution(&next_dist, rng_state);
+    *position = j + beam[0].length;
+    model->mtp_hidden_source = (int)beam[0].length;
+    model->mtp_next_logit_row = beam[0].length - 1;
     model->mtp_next_logits_valid = 1;
 
     if (best_score_out != NULL) *best_score_out = best_score;
