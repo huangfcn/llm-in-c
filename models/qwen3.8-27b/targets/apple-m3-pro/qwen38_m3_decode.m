@@ -6,6 +6,7 @@
 #include "qwen38_m3_attention_image.h"
 #include "qwen38_m3_global_image.h"
 #include "qwen38_m3_mtp_image.h"
+#include "qwen38_m3_dflash2_image.h"
 #include "qwen38_m3_image.h"
 
 #include <fcntl.h>
@@ -41,6 +42,11 @@ typedef struct {
      * zeros for rows past this edge. */
     uint32_t batch;
 } q38_prefill_attention_parameters;
+
+typedef struct { uint32_t start_position, tap_slot; } q38_dflash_capture_parameters;
+typedef struct { uint32_t start_position, rows; } q38_dflash_gather_parameters;
+typedef struct { uint32_t start_position, rows; } q38_dflash_context_parameters;
+typedef struct { uint32_t proposal_position, context_count, proposal_rows, reserved; } q38_dflash_attention_parameters;
 
 enum { Q38_PREFILL_MAX_BATCH = 128 };
 
@@ -98,6 +104,23 @@ enum {
     id<MTLComputePipelineState> attention_scores;
     id<MTLComputePipelineState> attention_softmax_value;
     id<MTLComputePipelineState> mtp_fuse;
+    id<MTLComputePipelineState> dflash_capture;
+    id<MTLComputePipelineState> dflash_gather;
+    id<MTLComputePipelineState> dflash_rms_f16;
+    id<MTLComputePipelineState> dflash_rms_f32;
+    id<MTLComputePipelineState> dflash_f16_gemm;
+    id<MTLComputePipelineState> dflash_dynamic_prepare;
+    id<MTLComputePipelineState> dflash_dynamic_finish;
+    id<MTLComputePipelineState> dflash_add;
+    id<MTLComputePipelineState> dflash_copy_float;
+    id<MTLComputePipelineState> dflash_half_to_float;
+    id<MTLComputePipelineState> dflash_float_to_half_width;
+    id<MTLComputePipelineState> dflash_prepare_q;
+    id<MTLComputePipelineState> dflash_prepare_prop_k;
+    id<MTLComputePipelineState> dflash_prepare_context_k;
+    id<MTLComputePipelineState> dflash_store_context_v;
+    id<MTLComputePipelineState> dflash_scores;
+    id<MTLComputePipelineState> dflash_value;
     id<MTLComputePipelineState> delta_conv_cap;
     id<MTLComputePipelineState> delta_prepare_cap;
     id<MTLComputePipelineState> silu_mul_cap;
@@ -189,6 +212,91 @@ enum {
 }
 @end
 
+
+@interface Q38DFlashLayer : NSObject {
+@public
+    id<MTLBuffer> input_norm;
+    id<MTLBuffer> attention_conv_base;
+    id<MTLBuffer> attention_conv_projection;
+    id<MTLBuffer> q_quants; id<MTLBuffer> q_metadata;
+    id<MTLBuffer> k_quants; id<MTLBuffer> k_metadata;
+    id<MTLBuffer> v_quants; id<MTLBuffer> v_metadata;
+    id<MTLBuffer> q_norm; id<MTLBuffer> k_norm;
+    id<MTLBuffer> o_quants; id<MTLBuffer> o_metadata;
+    id<MTLBuffer> post_norm;
+    id<MTLBuffer> mlp_conv_base;
+    id<MTLBuffer> mlp_conv_projection;
+    id<MTLBuffer> gate_quants; id<MTLBuffer> gate_metadata;
+    id<MTLBuffer> up_quants; id<MTLBuffer> up_metadata;
+    id<MTLBuffer> down_quants; id<MTLBuffer> down_metadata;
+    id<MTLBuffer> key_cache;
+    id<MTLBuffer> value_cache;
+}
+@end
+@implementation Q38DFlashLayer @end
+
+@interface Q38DFlashRuntime : NSObject {
+@public
+    int file;
+    void *mapping;
+    size_t mapping_length;
+    const qwen38_m3_dflash2_image_header *header;
+    id<MTLBuffer> feature_quants; id<MTLBuffer> feature_metadata;
+    id<MTLBuffer> context_norm;
+    NSMutableArray<Q38DFlashLayer *> *layers;
+    id<MTLBuffer> final_norm;
+    id<MTLBuffer> selector_projection;
+    id<MTLBuffer> predecessor_codebook;
+    id<MTLBuffer> successor_codebook;
+
+    /* Target residual-stream ring: 2048 positions x five 5120-wide taps.
+     * Tags make prefix rewinds safe: if a row was overwritten, the drafter
+     * simply rebuilds from the longest still-valid suffix. Proposal quality
+     * may fall, but target rejection sampling remains exact. */
+    id<MTLBuffer> target_taps;
+    id<MTLBuffer> target_tags;
+    id<MTLBuffer> gathered_taps;
+    id<MTLBuffer> context_fc;
+    id<MTLBuffer> context_half;
+    id<MTLBuffer> context_k;
+    id<MTLBuffer> context_v;
+
+    /* One parallel proposal block (maximum 8 rows = anchor + seven drafts). */
+    id<MTLBuffer> block_ids;
+    id<MTLBuffer> x_half;
+    id<MTLBuffer> residual;
+    id<MTLBuffer> normalized;
+    id<MTLBuffer> dynamic;
+    id<MTLBuffer> conv_half;
+    id<MTLBuffer> q_projected;
+    id<MTLBuffer> k_projected;
+    id<MTLBuffer> v_projected;
+    id<MTLBuffer> query;
+    id<MTLBuffer> prop_key;
+    id<MTLBuffer> prop_value;
+    id<MTLBuffer> scores;
+    id<MTLBuffer> attention_output;
+    id<MTLBuffer> sublayer_output;
+    id<MTLBuffer> temp0;
+    id<MTLBuffer> temp1;
+    id<MTLBuffer> mlp_gate;
+    id<MTLBuffer> mlp_up;
+    id<MTLBuffer> mlp_activated;
+    id<MTLBuffer> mlp_half;
+    id<MTLBuffer> final_half;
+    id<MTLBuffer> logits;
+    id<MTLBuffer> selector_hidden;
+
+    uint32_t block_size;
+    uint32_t context_end;   /* absolute position immediately after cached context */
+    uint32_t context_count; /* <= 2047 */
+}
+@end
+@implementation Q38DFlashRuntime
+- (instancetype)init { self=[super init]; if(self){file=-1;mapping=MAP_FAILED;} return self; }
+- (void)dealloc { if(mapping!=MAP_FAILED)munmap(mapping,mapping_length); if(file>=0)close(file); }
+@end
+
 @interface Q38DecodeRuntime : NSObject {
 @public
     id<MTLDevice> device;
@@ -251,6 +359,7 @@ enum {
      * kernel that keeps both QK score accumulators live so each Q tile is
      * loaded once for the two position tiles owned by a simdgroup. */
     int flash_qk_reuse;
+    Q38DFlashRuntime *dflash;
 
     id<MTLComputePipelineState> rms_half;
     id<MTLComputePipelineState> rms_float;
@@ -1012,6 +1121,26 @@ static Q38PrefillPipelines *prefill_pipelines(
                        @"qwen38_prefill_flash_attention_pvreuse" :
                        @"qwen38_prefill_flash_attention"))));
     MAKE_PREFILL(mtp_fuse, @"qwen38_prefill_mtp_fuse");
+    const char *dflash_env = getenv("QWEN38_DFLASH2");
+    if (dflash_env != NULL && strcmp(dflash_env, "0") != 0) {
+        MAKE_PREFILL(dflash_capture, @"qwen38_dflash_capture_target");
+        MAKE_PREFILL(dflash_gather, @"qwen38_dflash_gather_target");
+        MAKE_PREFILL(dflash_rms_f16, @"qwen38_dflash_rms_f16");
+        MAKE_PREFILL(dflash_rms_f32, @"qwen38_dflash_rms_f32");
+        MAKE_PREFILL(dflash_f16_gemm, @"qwen38_dflash_f16_gemm");
+        MAKE_PREFILL(dflash_dynamic_prepare, @"qwen38_dflash_dynamic_prepare");
+        MAKE_PREFILL(dflash_dynamic_finish, @"qwen38_dflash_dynamic_finish");
+        MAKE_PREFILL(dflash_add, @"qwen38_dflash_add_residual");
+        MAKE_PREFILL(dflash_copy_float, @"qwen38_dflash_copy_float");
+        MAKE_PREFILL(dflash_half_to_float, @"qwen38_dflash_half_to_float");
+        MAKE_PREFILL(dflash_float_to_half_width, @"qwen38_dflash_float_to_half_width");
+        MAKE_PREFILL(dflash_prepare_q, @"qwen38_dflash_prepare_q");
+        MAKE_PREFILL(dflash_prepare_prop_k, @"qwen38_dflash_prepare_prop_k");
+        MAKE_PREFILL(dflash_prepare_context_k, @"qwen38_dflash_prepare_context_k");
+        MAKE_PREFILL(dflash_store_context_v, @"qwen38_dflash_store_context_v");
+        MAKE_PREFILL(dflash_scores, @"qwen38_dflash_scores");
+        MAKE_PREFILL(dflash_value, @"qwen38_dflash_value");
+    }
 #undef MAKE_PREFILL
     return p;
 }
@@ -1778,6 +1907,31 @@ static void profile_report(Q38DecodeRuntime *r, Q38Profile *profile,
         }
 }
 
+static int dflash_tap_slot(unsigned layer_index) {
+    switch (layer_index) {
+    case 5: return 0; case 19: return 1; case 33: return 2;
+    case 47: return 3; case 61: return 4; default: return -1;
+    }
+}
+
+static void encode_dflash_capture(Q38DecodeRuntime *r,
+                                  Q38PrefillPipelines *p,
+                                  id<MTLComputeCommandEncoder> encoder,
+                                  unsigned layer_index,
+                                  uint32_t start_position) {
+    if (r->dflash == nil) return;
+    int slot = dflash_tap_slot(layer_index);
+    if (slot < 0) return;
+    q38_dflash_capture_parameters cp = {start_position, (uint32_t)slot};
+    [encoder setComputePipelineState:p->dflash_capture];
+    [encoder setBuffer:r->p_layer_output offset:0 atIndex:0];
+    [encoder setBuffer:r->dflash->target_taps offset:0 atIndex:1];
+    [encoder setBuffer:r->dflash->target_tags offset:0 atIndex:2];
+    [encoder setBytes:&cp length:sizeof(cp) atIndex:3];
+    [encoder dispatchThreads:MTLSizeMake(5120, p->batch, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+}
+
 static void encode_prefill_chunk(Q38DecodeRuntime *r,
                                  Q38PrefillPipelines *p,
                                  id<MTLCommandBuffer> *command,
@@ -1800,6 +1954,7 @@ static void encode_prefill_chunk(Q38DecodeRuntime *r,
                                               start_position, profile, index);
         else
             encode_prefill_delta(r, p, command, encoder, layer, profile, index);
+        encode_dflash_capture(r, p, *encoder, index, start_position);
         if (index != 63) {
             [*encoder setComputePipelineState:p->convert_hidden];
             [*encoder setBuffer:prefill_buffer(r, p, 19) offset:0 atIndex:0];
@@ -2313,6 +2468,12 @@ void qwen38_m3_model_reset(qwen38_m3_model *model) {
         memset(r->mtp_layer->value_cache.contents, 0,
                r->mtp_layer->value_cache.length);
     }
+    if (r->dflash != nil) {
+        r->dflash->context_end = 0;
+        r->dflash->context_count = 0;
+        memset(r->dflash->target_tags.contents, 0,
+               r->dflash->target_tags.length);
+    }
     model->mtp_hidden_source = 0;
     model->mtp_next_logits_valid = 0;
 }
@@ -2364,6 +2525,19 @@ int qwen38_m3_model_forward_submit(
                 encode_attention(r, encoder, layer, position);
             else
                 encode_delta(r, encoder, layer);
+            if (r->dflash != nil) {
+                int dslot = dflash_tap_slot(index);
+                if (dslot >= 0 && r->prefill1 != nil) {
+                    q38_dflash_capture_parameters cp = {position, (uint32_t)dslot};
+                    [encoder setComputePipelineState:r->prefill1->dflash_capture];
+                    [encoder setBuffer:r->layer_output offset:0 atIndex:0];
+                    [encoder setBuffer:r->dflash->target_taps offset:0 atIndex:1];
+                    [encoder setBuffer:r->dflash->target_tags offset:0 atIndex:2];
+                    [encoder setBytes:&cp length:sizeof(cp) atIndex:3];
+                    [encoder dispatchThreads:MTLSizeMake(5120, 1, 1)
+                            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                }
+            }
             if (index != 63) {
                 [encoder setComputePipelineState:r->convert_hidden];
                 [encoder setBuffer:r->layer_output offset:0 atIndex:0];
@@ -4644,8 +4818,433 @@ void qwen38_m3_model_close(qwen38_m3_model *model) {
         if (r->mtp_mapping != NULL && r->mtp_mapping != MAP_FAILED)
             munmap(r->mtp_mapping, r->mtp_mapping_length);
         if (r->mtp_file > 0) close(r->mtp_file);
+        if (r->dflash != nil) {
+            if (r->dflash->mapping != NULL && r->dflash->mapping != MAP_FAILED)
+                munmap(r->dflash->mapping, r->dflash->mapping_length);
+            if (r->dflash->file >= 0) close(r->dflash->file);
+            r->dflash->mapping = MAP_FAILED;
+            r->dflash->file = -1;
+        }
         CFBridgingRelease(model->runtime);
         model->runtime = NULL;
     }
     free(model);
+}
+
+/* ========================== DFlash2 runtime ========================== */
+
+static int q38_dflash_bind_q4(Q38DecodeRuntime *r, Q38DFlashRuntime *d,
+                              qwen38_m3_dflash2_q4_matrix m,
+                              id<MTLBuffer> __strong *q,
+                              id<MTLBuffer> __strong *meta) {
+    if (m.columns == 0 || m.rows == 0 || (m.columns & 63u) != 0 ||
+        m.quants_offset + m.quants_bytes > d->mapping_length ||
+        m.metadata_offset + m.metadata_bytes > d->mapping_length)
+        return -1;
+    *q = mapped_buffer(r->device, d->mapping, m.quants_offset, m.quants_bytes);
+    *meta = mapped_buffer(r->device, d->mapping, m.metadata_offset, m.metadata_bytes);
+    return (*q != nil && *meta != nil) ? 0 : -1;
+}
+
+static id<MTLBuffer> q38_dflash_bind_f16(Q38DecodeRuntime *r,
+                                          Q38DFlashRuntime *d,
+                                          uint64_t offset, uint64_t bytes) {
+    if (offset + bytes > d->mapping_length) return nil;
+    return mapped_buffer(r->device, d->mapping, offset, bytes);
+}
+
+static void encode_dflash_f16_gemm(Q38PrefillPipelines *p,
+                                    id<MTLComputeCommandEncoder> encoder,
+                                    id<MTLBuffer> x, id<MTLBuffer> w,
+                                    id<MTLBuffer> output,
+                                    uint32_t rows, uint32_t columns) {
+    q38_prefill_gemm_parameters gp = {rows, columns};
+    [encoder setComputePipelineState:p->dflash_f16_gemm];
+    [encoder setBuffer:x offset:0 atIndex:0];
+    [encoder setBuffer:w offset:0 atIndex:1];
+    [encoder setBuffer:output offset:0 atIndex:2];
+    [encoder setBytes:&gp length:sizeof(gp) atIndex:3];
+    [encoder dispatchThreadgroups:MTLSizeMake((rows + 7) / 8, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+}
+
+static Q38PrefillPipelines *dflash_bucket(Q38DecodeRuntime *r, uint32_t n) {
+    switch (n) {
+    case 1:return r->prefill1; case 2:return r->prefill2;
+    case 3:return r->prefill3; case 4:return r->prefill4;
+    case 5:return r->prefill5; case 6:return r->prefill6;
+    case 7:return r->prefill7; case 8:return r->prefill8;
+    case 16:return r->prefill16; case 32:return r->prefill32;
+    case 64:return r->prefill64; default:return r->prefill128;
+    }
+}
+
+static uint32_t dflash_chunk(uint32_t remain) {
+    if (remain >= 128) return 128;
+    if (remain >= 64) return 64;
+    if (remain >= 32) return 32;
+    if (remain >= 16) return 16;
+    if (remain >= 8) return 8;
+    return remain; /* 1..7 have exact buckets after dflash open */
+}
+
+static int dflash_tags_cover(Q38DFlashRuntime *d, uint32_t start, uint32_t end) {
+    const uint32_t *tags = d->target_tags.contents;
+    for (uint32_t p=start;p<end;++p)
+        if (tags[p & 2047u] != p + 1u) return 0;
+    return 1;
+}
+
+/* Project newly confirmed target hidden taps into the five DFlash2 layer KV
+ * rings. The target ring contains only 2048 absolute-position tagged rows;
+ * after a prefix rewind, rebuild from the longest still-valid suffix. */
+static int dflash_update_context(qwen38_m3_model *model, uint32_t position,
+                                 char *error_message, size_t cap) {
+    Q38DecodeRuntime *r=(__bridge Q38DecodeRuntime *)model->runtime;
+    Q38DFlashRuntime *d=r->dflash;
+    if(d==nil)return 1;
+    uint32_t start=d->context_end;
+    int append = start <= position && position-start <= 2047u &&
+                 dflash_tags_cover(d,start,position);
+    if(!append){
+        uint32_t limit=position>2047u?position-2047u:0u;
+        start=position;
+        const uint32_t *tags=d->target_tags.contents;
+        while(start>limit && tags[(start-1)&2047u]==start)--start;
+        d->context_count=0;
+        d->context_end=start;
+    }
+    while(start<position){
+        uint32_t n=dflash_chunk(position-start);
+        Q38PrefillPipelines *p=dflash_bucket(r,n);
+        if(p==nil){decode_error(error_message,cap,@"missing DFlash2 batch pipeline");return 2;}
+        MTLCommandBufferStatus st; NSString *failure=nil;
+        @autoreleasepool{
+            id<MTLCommandBuffer> cb=[r->queue commandBuffer];
+            id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
+            q38_dflash_gather_parameters gp={start,n};
+            [e setComputePipelineState:p->dflash_gather];
+            [e setBuffer:d->target_taps offset:0 atIndex:0];
+            [e setBuffer:d->gathered_taps offset:0 atIndex:1];
+            [e setBytes:&gp length:sizeof(gp) atIndex:2];
+            [e dispatchThreads:MTLSizeMake(25600,n,1)
+                    threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            encode_prefill_gemm_f16(r,p,e,d->gathered_taps,
+                                    d->feature_quants,d->feature_metadata,
+                                    d->context_fc,5120,400);
+            [e setComputePipelineState:p->dflash_rms_f32];
+            [e setBuffer:d->context_fc offset:0 atIndex:0];
+            [e setBuffer:d->context_norm offset:0 atIndex:1];
+            [e setBuffer:d->context_half offset:0 atIndex:2];
+            [e dispatchThreadgroups:MTLSizeMake(n,1,1)
+                    threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            q38_dflash_context_parameters cp={start,n};
+            for(uint32_t li=0;li<5;++li){
+                Q38DFlashLayer *l=d->layers[li];
+                encode_prefill_gemm_f16(r,p,e,d->context_half,l->k_quants,l->k_metadata,
+                                        d->context_k,1024,80);
+                encode_prefill_gemm_f16(r,p,e,d->context_half,l->v_quants,l->v_metadata,
+                                        d->context_v,1024,80);
+                [e setComputePipelineState:p->dflash_prepare_context_k];
+                [e setBuffer:d->context_k offset:0 atIndex:0];
+                [e setBuffer:l->k_norm offset:0 atIndex:1];
+                [e setBytes:&cp length:sizeof(cp) atIndex:2];
+                [e setBuffer:l->key_cache offset:0 atIndex:3];
+                [e dispatchThreadgroups:MTLSizeMake(8,n,1)
+                        threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+                [e setComputePipelineState:p->dflash_store_context_v];
+                [e setBuffer:d->context_v offset:0 atIndex:0];
+                [e setBytes:&cp length:sizeof(cp) atIndex:1];
+                [e setBuffer:l->value_cache offset:0 atIndex:2];
+                [e dispatchThreads:MTLSizeMake(1024,n,1)
+                        threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            }
+            [e endEncoding];[cb commit];[cb waitUntilCompleted];st=cb.status;
+            if(cb.error!=nil)failure=cb.error.localizedDescription;
+        }
+        if(st!=MTLCommandBufferStatusCompleted){decode_error(error_message,cap,failure != nil ? failure : @"DFlash2 context update failed");return 2;}
+        start+=n; d->context_end=start;
+        d->context_count = d->context_count+n>2047u?2047u:d->context_count+n;
+    }
+    return 0;
+}
+
+/* One DFlash2 block forward.  It predicts block-1 sparse proposal
+ * distributions in parallel; the sequential selector walk is cheap on CPU
+ * (7 x top16 x rank256) and keeps v1 simple. */
+static int dflash_propose(qwen38_m3_model *model,uint32_t anchor,uint32_t position,
+                          uint32_t block,float temperature,uint64_t *rng,
+                          uint32_t drafts[7],q38_mtp_distribution qrows[7],
+                          char *error_message,size_t cap){
+    Q38DecodeRuntime *r=(__bridge Q38DecodeRuntime *)model->runtime;
+    Q38DFlashRuntime *d=r->dflash;
+    int cs=dflash_update_context(model,position,error_message,cap); if(cs)return cs;
+    Q38PrefillPipelines *p=dflash_bucket(r,block); if(p==nil)return 2;
+    uint32_t *ids=d->block_ids.contents; ids[0]=anchor;
+    for(uint32_t i=1;i<block;++i)ids[i]=QWEN38_M3_DFLASH2_MASK_ID;
+    q38_dflash_attention_parameters ap={position,d->context_count,block,0};
+    MTLCommandBufferStatus st; NSString *failure=nil;
+    double tic=decode_seconds();
+    @autoreleasepool{
+        id<MTLCommandBuffer> cb=[r->queue commandBuffer];
+        id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
+        [e setComputePipelineState:p->embedding];
+        [e setBuffer:r->global->embedding_quants offset:0 atIndex:0];
+        [e setBuffer:r->global->embedding_metadata offset:0 atIndex:1];
+        [e setBuffer:d->block_ids offset:0 atIndex:2];
+        [e setBuffer:d->x_half offset:0 atIndex:3];
+        [e dispatchThreads:MTLSizeMake(5120,block,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        [e setComputePipelineState:p->dflash_half_to_float];
+        [e setBuffer:d->x_half offset:0 atIndex:0];[e setBuffer:d->residual offset:0 atIndex:1];
+        [e dispatchThreads:MTLSizeMake(5120,block,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        for(uint32_t li=0;li<5;++li){
+            Q38DFlashLayer *l=d->layers[li];
+            /* attention sublayer */
+            [e setComputePipelineState:p->dflash_rms_f32];
+            [e setBuffer:d->residual offset:0 atIndex:0];[e setBuffer:l->input_norm offset:0 atIndex:1];[e setBuffer:d->normalized offset:0 atIndex:2];
+            [e dispatchThreadgroups:MTLSizeMake(block,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            encode_dflash_f16_gemm(p,e,d->normalized,l->attention_conv_projection,d->dynamic,1280,5120);
+            [e setComputePipelineState:p->dflash_dynamic_prepare];
+            [e setBuffer:d->normalized offset:0 atIndex:0];[e setBuffer:d->dynamic offset:0 atIndex:1];[e setBuffer:l->attention_conv_base offset:0 atIndex:2];[e setBuffer:d->conv_half offset:0 atIndex:3];
+            [e dispatchThreads:MTLSizeMake(5120,block,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            encode_prefill_gemm_f16(r,p,e,d->conv_half,l->q_quants,l->q_metadata,d->q_projected,4096,80);
+            encode_prefill_gemm_f16(r,p,e,d->conv_half,l->k_quants,l->k_metadata,d->k_projected,1024,80);
+            encode_prefill_gemm_f16(r,p,e,d->conv_half,l->v_quants,l->v_metadata,d->v_projected,1024,80);
+            [e setComputePipelineState:p->dflash_prepare_q];[e setBuffer:d->q_projected offset:0 atIndex:0];[e setBuffer:l->q_norm offset:0 atIndex:1];[e setBytes:&ap length:sizeof(ap) atIndex:2];[e setBuffer:d->query offset:0 atIndex:3];
+            [e dispatchThreadgroups:MTLSizeMake(32,block,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+            [e setComputePipelineState:p->dflash_prepare_prop_k];[e setBuffer:d->k_projected offset:0 atIndex:0];[e setBuffer:l->k_norm offset:0 atIndex:1];[e setBytes:&ap length:sizeof(ap) atIndex:2];[e setBuffer:d->prop_key offset:0 atIndex:3];
+            [e dispatchThreadgroups:MTLSizeMake(8,block,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+            uint32_t width=1024;[e setComputePipelineState:p->dflash_float_to_half_width];[e setBuffer:d->v_projected offset:0 atIndex:0];[e setBuffer:d->prop_value offset:0 atIndex:1];[e setBytes:&width length:sizeof(width) atIndex:2];[e dispatchThreads:MTLSizeMake(1024,block,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            [e setComputePipelineState:p->dflash_scores];[e setBuffer:d->query offset:0 atIndex:0];[e setBuffer:l->key_cache offset:0 atIndex:1];[e setBuffer:d->prop_key offset:0 atIndex:2];[e setBytes:&ap length:sizeof(ap) atIndex:3];[e setBuffer:d->scores offset:0 atIndex:4];
+            [e dispatchThreadgroups:MTLSizeMake(1,block*32,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            [e setComputePipelineState:p->dflash_value];[e setBuffer:d->scores offset:0 atIndex:0];[e setBuffer:l->value_cache offset:0 atIndex:1];[e setBuffer:d->prop_value offset:0 atIndex:2];[e setBytes:&ap length:sizeof(ap) atIndex:3];[e setBuffer:d->attention_output offset:0 atIndex:4];
+            [e dispatchThreadgroups:MTLSizeMake(block*32,1,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+            width=4096;[e setComputePipelineState:p->dflash_float_to_half_width];[e setBuffer:d->attention_output offset:0 atIndex:0];[e setBuffer:d->mlp_half offset:0 atIndex:1];[e setBytes:&width length:sizeof(width) atIndex:2];[e dispatchThreads:MTLSizeMake(4096,block,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            encode_prefill_gemm_f16(r,p,e,d->mlp_half,l->o_quants,l->o_metadata,d->temp0,5120,64);
+            [e setComputePipelineState:p->dflash_dynamic_finish];[e setBuffer:d->temp0 offset:0 atIndex:0];[e setBuffer:d->dynamic offset:0 atIndex:1];[e setBuffer:l->attention_conv_base offset:0 atIndex:2];[e setBuffer:d->temp1 offset:0 atIndex:3];[e dispatchThreads:MTLSizeMake(5120,block,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            [e setComputePipelineState:p->dflash_add];[e setBuffer:d->temp1 offset:0 atIndex:0];[e setBuffer:d->residual offset:0 atIndex:1];[e setBuffer:d->temp0 offset:0 atIndex:2];[e dispatchThreads:MTLSizeMake(5120,block,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            [e setComputePipelineState:p->dflash_copy_float];
+            [e setBuffer:d->temp0 offset:0 atIndex:0];
+            [e setBuffer:d->residual offset:0 atIndex:1];
+            [e dispatchThreads:MTLSizeMake(5120,block,1)
+                    threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            /* MLP sublayer */
+            [e setComputePipelineState:p->dflash_rms_f32];[e setBuffer:d->residual offset:0 atIndex:0];[e setBuffer:l->post_norm offset:0 atIndex:1];[e setBuffer:d->normalized offset:0 atIndex:2];[e dispatchThreadgroups:MTLSizeMake(block,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            encode_dflash_f16_gemm(p,e,d->normalized,l->mlp_conv_projection,d->dynamic,1280,5120);
+            [e setComputePipelineState:p->dflash_dynamic_prepare];[e setBuffer:d->normalized offset:0 atIndex:0];[e setBuffer:d->dynamic offset:0 atIndex:1];[e setBuffer:l->mlp_conv_base offset:0 atIndex:2];[e setBuffer:d->conv_half offset:0 atIndex:3];[e dispatchThreads:MTLSizeMake(5120,block,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            encode_prefill_gemm_f16(r,p,e,d->conv_half,l->gate_quants,l->gate_metadata,d->mlp_gate,17408,80);
+            encode_prefill_gemm_f16(r,p,e,d->conv_half,l->up_quants,l->up_metadata,d->mlp_up,17408,80);
+            [e setComputePipelineState:p->silu_mul_cap];[e setBuffer:d->mlp_gate offset:0 atIndex:0];[e setBuffer:d->mlp_up offset:0 atIndex:1];[e setBuffer:d->mlp_activated offset:0 atIndex:2];[e setBuffer:d->mlp_half offset:0 atIndex:3];[e dispatchThreads:MTLSizeMake(17408,block,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            encode_prefill_gemm_f16(r,p,e,d->mlp_half,l->down_quants,l->down_metadata,d->temp0,5120,272);
+            [e setComputePipelineState:p->dflash_dynamic_finish];[e setBuffer:d->temp0 offset:0 atIndex:0];[e setBuffer:d->dynamic offset:0 atIndex:1];[e setBuffer:l->mlp_conv_base offset:0 atIndex:2];[e setBuffer:d->temp1 offset:0 atIndex:3];[e dispatchThreads:MTLSizeMake(5120,block,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            [e setComputePipelineState:p->dflash_add];[e setBuffer:d->temp1 offset:0 atIndex:0];[e setBuffer:d->residual offset:0 atIndex:1];[e setBuffer:d->temp0 offset:0 atIndex:2];[e dispatchThreads:MTLSizeMake(5120,block,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            [e setComputePipelineState:p->dflash_copy_float];
+            [e setBuffer:d->temp0 offset:0 atIndex:0];
+            [e setBuffer:d->residual offset:0 atIndex:1];
+            [e dispatchThreads:MTLSizeMake(5120,block,1)
+                    threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        }
+        [e setComputePipelineState:p->dflash_rms_f32];[e setBuffer:d->residual offset:0 atIndex:0];[e setBuffer:d->final_norm offset:0 atIndex:1];[e setBuffer:d->final_half offset:0 atIndex:2];[e dispatchThreadgroups:MTLSizeMake(block,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        encode_prefill_gemm_f16(r,p,e,d->final_half,r->global->lm_head_quants,r->global->lm_head_metadata,d->logits,QWEN38_VOCAB_SIZE,80);
+        encode_dflash_f16_gemm(p,e,d->final_half,d->selector_projection,d->selector_hidden,256,5120);
+        [e endEncoding];[cb commit];[cb waitUntilCompleted];st=cb.status;if(cb.error!=nil)failure=cb.error.localizedDescription;
+    }
+    if(st!=MTLCommandBufferStatusCompleted){decode_error(error_message,cap,failure != nil ? failure : @"DFlash2 proposal failed");return 2;}
+    if(getenv("QWEN38_DFLASH_DEBUG")!=NULL)fprintf(stderr,"[dflash2-propose] block %u ctx %u %.1f ms\n",block,d->context_count,(decode_seconds()-tic)*1000.0);
+
+    const float *logits=d->logits.contents; const float *hp=d->selector_hidden.contents;
+    const __fp16 *pred=(const __fp16 *)d->predecessor_codebook.contents;
+    const __fp16 *succ=(const __fp16 *)d->successor_codebook.contents;
+    uint32_t predecessor=anchor;
+    for(uint32_t pos=1;pos<block;++pos){
+        uint32_t cand[16]; float unary[16]; for(int k=0;k<16;++k){cand[k]=0;unary[k]=-FLT_MAX;}
+        const float *row=logits+(size_t)pos*QWEN38_VOCAB_SIZE;
+        for(uint32_t id=0;id<QWEN38_VOCAB_SIZE;++id){float v=row[id];if(v<=unary[15])continue;int k=15;while(k>0&&v>unary[k-1]){unary[k]=unary[k-1];cand[k]=cand[k-1];--k;}unary[k]=v;cand[k]=id;}
+        double score[16],mx=-INFINITY;
+        const float *hh=hp+(size_t)pos*256; const __fp16 *pa=pred+(size_t)predecessor*256;
+        for(int k=0;k<16;++k){const __fp16 *sb=succ+(size_t)cand[k]*256;double edge=0.0;for(int z=0;z<256;++z)edge+=(double)(float)pa[z]*(double)hh[z]*(double)(float)sb[z];score[k]=(double)unary[k]+edge;if(score[k]>mx)mx=score[k];}
+        double sum=0.0;
+        for(int k=0;k<16;++k){
+            qrows[pos-1].ids[k]=cand[k];
+            qrows[pos-1].probabilities[k]=exp((score[k]-mx)/temperature);
+            sum+=qrows[pos-1].probabilities[k];
+        }
+        qrows[pos-1].count=16;
+        if(!(sum>0.0) || !isfinite(sum)){
+            for(int k=0;k<16;++k)qrows[pos-1].probabilities[k]=(k==0)?1.0:0.0;
+        }else{
+            for(int k=0;k<16;++k)qrows[pos-1].probabilities[k]/=sum;
+        }
+        drafts[pos-1]=q38_mtp_sample_distribution(&qrows[pos-1],rng); predecessor=drafts[pos-1];
+    }
+    return 0;
+}
+
+static int q38_dflash_ensure_verifier(Q38DecodeRuntime *r,
+                                       NSString **message) {
+    MTLResourceOptions options = MTLResourceStorageModeShared;
+    if (r->p_logits2 == nil) {
+        r->p_logits2 = [r->device
+            newBufferWithLength:(size_t)8 * QWEN38_VOCAB_SIZE * sizeof(float)
+                        options:options];
+    }
+
+    size_t recurrent_total = 0;
+    size_t convolution_total = 0;
+    for (Q38DecodeLayer *layer in r->layers) {
+        if (layer->attention) continue;
+        recurrent_total += layer->recurrent_state.length;
+        convolution_total += layer->convolution_state.length;
+    }
+    if (r->snapshot_recurrent == nil) {
+        r->snapshot_recurrent = [r->device newBufferWithLength:recurrent_total
+                                                       options:options];
+    }
+    if (r->snapshot_convolution == nil) {
+        r->snapshot_convolution = [r->device newBufferWithLength:convolution_total
+                                                         options:options];
+    }
+
+#define Q38_DFLASH_ENSURE_PREFILL(field, n) do { \
+    if (r->field == nil) { \
+        r->field = prefill_pipelines(r, (n), message); \
+        if (r->field == nil) return -1; \
+    } \
+} while (0)
+    Q38_DFLASH_ENSURE_PREFILL(prefill1, 1);
+    Q38_DFLASH_ENSURE_PREFILL(prefill2, 2);
+    Q38_DFLASH_ENSURE_PREFILL(prefill3, 3);
+    Q38_DFLASH_ENSURE_PREFILL(prefill4, 4);
+    Q38_DFLASH_ENSURE_PREFILL(prefill5, 5);
+    Q38_DFLASH_ENSURE_PREFILL(prefill6, 6);
+    Q38_DFLASH_ENSURE_PREFILL(prefill7, 7);
+    Q38_DFLASH_ENSURE_PREFILL(prefill8, 8);
+#undef Q38_DFLASH_ENSURE_PREFILL
+
+    if (r->p_logits2 == nil || r->snapshot_recurrent == nil ||
+        r->snapshot_convolution == nil) {
+        if (message != NULL)
+            *message = @"cannot allocate DFlash2 target verifier state";
+        return -1;
+    }
+    return 0;
+}
+
+int qwen38_m3_model_dflash2_open(qwen38_m3_model *model,const char *image_path,
+                                  char *error_message,size_t cap){
+    if(model==NULL||model->runtime==NULL||image_path==NULL){decode_error(error_message,cap,@"invalid DFlash2 open arguments");return 1;}
+    Q38DecodeRuntime *r=(__bridge Q38DecodeRuntime *)model->runtime; if(r->dflash!=nil)return 0;
+    @autoreleasepool{
+        Q38DFlashRuntime *d=[Q38DFlashRuntime new]; NSString *msg=nil;
+        if(map_file(image_path,&d->file,&d->mapping,&d->mapping_length,&msg)!=0){decode_error(error_message,cap,msg);return 3;}
+        const qwen38_m3_dflash2_image_header *h=d->mapping; d->header=h;
+        if(d->mapping_length<sizeof(*h)||memcmp(h->magic,QWEN38_M3_DFLASH2_IMAGE_MAGIC,8)!=0||h->version!=1||h->header_bytes!=sizeof(*h)||h->file_bytes!=d->mapping_length||h->hidden_size!=5120||h->intermediate_size!=17408||h->vocab_size!=QWEN38_VOCAB_SIZE||h->num_layers!=5||h->q_heads!=32||h->kv_heads!=8||h->head_dim!=128||h->sliding_window!=2048||h->mask_token_id!=248070||h->selector_rank!=256||h->selector_top_k!=16||h->group_size!=64||h->target_layer_ids[0]!=5||h->target_layer_ids[1]!=19||h->target_layer_ids[2]!=33||h->target_layer_ids[3]!=47||h->target_layer_ids[4]!=61||fabsf(h->rope_theta-10000000.0f)>0.5f||fabsf(h->rms_epsilon-1.0e-6f)>1.0e-9f){decode_error(error_message,cap,@"invalid DFlash2 image header");return 3;}
+        if(q38_dflash_bind_q4(r,d,h->feature_projection,&d->feature_quants,&d->feature_metadata)!=0){decode_error(error_message,cap,@"invalid DFlash2 feature projection");return 3;}
+        d->context_norm=q38_dflash_bind_f16(r,d,h->context_norm.offset,h->context_norm.bytes);
+        d->layers=[NSMutableArray arrayWithCapacity:5];
+        for(uint32_t i=0;i<5;++i){const qwen38_m3_dflash2_layer_desc *x=&h->layers[i];Q38DFlashLayer*l=[Q38DFlashLayer new];
+#define DFV(field,desc) l->field=q38_dflash_bind_f16(r,d,(desc).offset,(desc).bytes)
+            DFV(input_norm,x->input_norm);DFV(attention_conv_base,x->attention_conv_base);DFV(attention_conv_projection,x->attention_conv_projection);
+            if(q38_dflash_bind_q4(r,d,x->q_proj,&l->q_quants,&l->q_metadata)||q38_dflash_bind_q4(r,d,x->k_proj,&l->k_quants,&l->k_metadata)||q38_dflash_bind_q4(r,d,x->v_proj,&l->v_quants,&l->v_metadata)||q38_dflash_bind_q4(r,d,x->o_proj,&l->o_quants,&l->o_metadata)||q38_dflash_bind_q4(r,d,x->gate_proj,&l->gate_quants,&l->gate_metadata)||q38_dflash_bind_q4(r,d,x->up_proj,&l->up_quants,&l->up_metadata)||q38_dflash_bind_q4(r,d,x->down_proj,&l->down_quants,&l->down_metadata)){decode_error(error_message,cap,@"invalid DFlash2 Q4 layer matrix");return 3;}
+            DFV(q_norm,x->q_norm);DFV(k_norm,x->k_norm);DFV(post_norm,x->post_attention_norm);DFV(mlp_conv_base,x->mlp_conv_base);DFV(mlp_conv_projection,x->mlp_conv_projection);
+#undef DFV
+            l->key_cache=[r->device newBufferWithLength:(size_t)2047*1024*2 options:MTLResourceStorageModeShared];l->value_cache=[r->device newBufferWithLength:(size_t)2047*1024*2 options:MTLResourceStorageModeShared];
+            if(l->input_norm==nil||l->attention_conv_base==nil||l->attention_conv_projection==nil||l->q_norm==nil||l->k_norm==nil||l->post_norm==nil||l->mlp_conv_base==nil||l->mlp_conv_projection==nil||l->key_cache==nil||l->value_cache==nil){decode_error(error_message,cap,@"cannot bind DFlash2 layer");return 3;}[d->layers addObject:l];}
+        d->final_norm=q38_dflash_bind_f16(r,d,h->final_norm.offset,h->final_norm.bytes);d->selector_projection=q38_dflash_bind_f16(r,d,h->selector_hidden_projection.offset,h->selector_hidden_projection.bytes);d->predecessor_codebook=q38_dflash_bind_f16(r,d,h->selector_predecessor.offset,h->selector_predecessor.bytes);d->successor_codebook=q38_dflash_bind_f16(r,d,h->selector_successor.offset,h->selector_successor.bytes);
+#define DFA(field,bytes) d->field=[r->device newBufferWithLength:(size_t)(bytes) options:MTLResourceStorageModeShared]
+        DFA(target_taps,(size_t)2048*5*5120*2);DFA(target_tags,2048*4);DFA(gathered_taps,(size_t)128*25600*2);DFA(context_fc,(size_t)128*5120*4);DFA(context_half,(size_t)128*5120*2);DFA(context_k,(size_t)128*1024*4);DFA(context_v,(size_t)128*1024*4);
+        DFA(block_ids,8*4);DFA(x_half,(size_t)8*5120*2);DFA(residual,(size_t)8*5120*4);DFA(normalized,(size_t)8*5120*2);DFA(dynamic,(size_t)8*1280*4);DFA(conv_half,(size_t)8*5120*2);DFA(q_projected,(size_t)8*4096*4);DFA(k_projected,(size_t)8*1024*4);DFA(v_projected,(size_t)8*1024*4);DFA(query,(size_t)8*4096*4);DFA(prop_key,(size_t)8*1024*2);DFA(prop_value,(size_t)8*1024*2);DFA(scores,(size_t)8*32*(2047+8)*4);DFA(attention_output,(size_t)8*4096*4);DFA(sublayer_output,(size_t)8*5120*4);DFA(temp0,(size_t)8*5120*4);DFA(temp1,(size_t)8*5120*4);DFA(mlp_gate,(size_t)8*17408*4);DFA(mlp_up,(size_t)8*17408*4);DFA(mlp_activated,(size_t)8*17408*4);DFA(mlp_half,(size_t)8*17408*2);DFA(final_half,(size_t)8*5120*2);DFA(logits,(size_t)8*QWEN38_VOCAB_SIZE*4);DFA(selector_hidden,(size_t)8*256*4);
+#undef DFA
+        if(d->context_norm==nil||d->final_norm==nil||d->selector_projection==nil||d->predecessor_codebook==nil||d->successor_codebook==nil||d->target_taps==nil||d->selector_hidden==nil){decode_error(error_message,cap,@"cannot allocate DFlash2 runtime");return 3;}
+        memset(d->target_tags.contents,0,d->target_tags.length);d->context_end=0;d->context_count=0;
+        const char *be=getenv("QWEN38_DFLASH_BLOCK");int bv=be?atoi(be):8;if(bv<2)bv=2;if(bv>8)bv=8;d->block_size=(uint32_t)bv;
+        NSString *pm=nil;
+        if(q38_dflash_ensure_verifier(r,&pm)!=0){decode_error(error_message,cap,pm != nil ? pm : @"cannot initialize DFlash2 target verifier");return 3;}
+        r->dflash=d;r->mapped_bytes+=d->mapping_length;
+        if(r->pin_weights!=0){if(mlock(d->mapping,d->mapping_length)==0)r->pinned_bytes+=d->mapping_length;else if(r->pin_weights==1)r->pin_weights=2;if(r->pin_weights==2)warm_mapping(d->mapping,d->mapping_length);}
+        fprintf(stderr,"DFlash2 active (block %u, Q4 backbone, selector top16, window 2048).\n",d->block_size);
+        return 0;
+    }
+}
+
+int qwen38_m3_model_dflash2_test_validate(
+    qwen38_m3_model *model, char *error_message, size_t cap) {
+    if (model == NULL || model->runtime == NULL) {
+        decode_error(error_message, cap, @"invalid DFlash2 test model");
+        return 1;
+    }
+    Q38DecodeRuntime *r = (__bridge Q38DecodeRuntime *)model->runtime;
+    if (r->dflash == nil) {
+        decode_error(error_message, cap, @"DFlash2 image not loaded");
+        return 1;
+    }
+    NSString *message = nil;
+    if (q38_dflash_ensure_verifier(r, &message) != 0) {
+        decode_error(error_message, cap,
+                     message != nil ? message : @"DFlash2 verifier unavailable");
+        return 2;
+    }
+    if (r->prefill8 == nil || r->prefill8->dflash_capture == nil ||
+        r->prefill8->dflash_gather == nil ||
+        r->prefill8->dflash_scores == nil ||
+        r->prefill8->dflash_value == nil) {
+        decode_error(error_message, cap,
+                     @"DFlash2 block-8 pipelines are incomplete");
+        return 3;
+    }
+    return 0;
+}
+
+int qwen38_m3_model_dflash2_test_propose(
+    qwen38_m3_model *model, uint32_t current_token, uint32_t position,
+    uint32_t block, uint32_t drafts[7], uint32_t *draft_count,
+    char *error_message, size_t cap) {
+    if (drafts == NULL || draft_count == NULL || block < 2 || block > 8) {
+        decode_error(error_message, cap, @"invalid DFlash2 proposal test arguments");
+        return 1;
+    }
+    int status = qwen38_m3_model_dflash2_test_validate(model, error_message, cap);
+    if (status != 0) return status;
+    q38_mtp_distribution qrows[7];
+    uint64_t rng = 0x6a09e667f3bcc909ULL;
+    status = dflash_propose(model, current_token, position, block, 1.0f,
+                            &rng, drafts, qrows, error_message, cap);
+    if (status == 0) *draft_count = block - 1;
+    return status;
+}
+
+int qwen38_m3_model_dflash2_test_verify(
+    qwen38_m3_model *model, const uint32_t *tokens, uint32_t batch,
+    uint32_t position, char *error_message, size_t cap) {
+    if (tokens == NULL || batch < 1 || batch > 8) {
+        decode_error(error_message, cap, @"invalid DFlash2 verify test arguments");
+        return 1;
+    }
+    int status = qwen38_m3_model_dflash2_test_validate(model, error_message, cap);
+    if (status != 0) return status;
+    status = model_forward_batch(model, tokens, batch, position, 1,
+                                 error_message, cap);
+    if (status != 0) return status;
+    /* Restore recurrent/convolution state so this diagnostic does not commit
+     * speculative rows. KV rows are position-addressed and will be overwritten
+     * by the next real verification. */
+    Q38DecodeRuntime *r = (__bridge Q38DecodeRuntime *)model->runtime;
+    gdn_state_copy(r, 1);
+    return 0;
+}
+
+int qwen38_m3_model_dflash2_sample_step(qwen38_m3_model *model,uint32_t *current_token,uint32_t *position,uint32_t emitted[8],uint32_t *emitted_count,int *accepted,float temperature,uint32_t top_k,float top_p,uint64_t *rng_state,char *error_message,size_t cap){
+    if(model==NULL||model->runtime==NULL||current_token==NULL||position==NULL||emitted==NULL||emitted_count==NULL||accepted==NULL||rng_state==NULL||temperature<=0.0f){decode_error(error_message,cap,@"invalid DFlash2 step arguments");return 1;}
+    Q38DecodeRuntime*r=(__bridge Q38DecodeRuntime*)model->runtime;Q38DFlashRuntime*d=r->dflash;if(d==nil){decode_error(error_message,cap,@"DFlash2 image not loaded");return 1;}
+    uint32_t j=*position,block=d->block_size;while(block>2&&(uint64_t)j+block>r->capacity)--block;if((uint64_t)j+block>r->capacity){decode_error(error_message,cap,@"DFlash2 exceeds context capacity");return 1;}
+    uint32_t depth=block-1,drafts[7]={0};q38_mtp_distribution qrows[7];double tic=decode_seconds();
+    int st=dflash_propose(model,*current_token,j,block,temperature,rng_state,drafts,qrows,error_message,cap);if(st)return st;
+    uint32_t tokens[8];tokens[0]=*current_token;for(uint32_t i=0;i<depth;++i)tokens[i+1]=drafts[i];
+    st=model_forward_batch(model,tokens,block,j,1,error_message,cap);if(st)return st;
+    const float *target=r->p_logits2.contents;uint32_t a=0;q38_mtp_distribution rejection={0};
+    for(;a<depth;++a){q38_mtp_distribution p;if(!q38_mtp_distribution_from_logits(target+(size_t)a*QWEN38_VOCAB_SIZE,QWEN38_VOCAB_SIZE,temperature,top_k,top_p,&p)){decode_error(error_message,cap,@"cannot build DFlash2 target distribution");return 1;}double pp=q38_mtp_probability(&p,drafts[a]),qq=q38_mtp_probability(&qrows[a],drafts[a]);double ratio=qq>0?pp/qq:1.0;if(ratio>1)ratio=1;if(q38_mtp_uniform(rng_state)<=ratio)continue;rejection=p;break;}
+    uint32_t emit=a+1,next=0;if(a==depth){q38_mtp_distribution p;if(!q38_mtp_distribution_from_logits(target+(size_t)depth*QWEN38_VOCAB_SIZE,QWEN38_VOCAB_SIZE,temperature,top_k,top_p,&p)){decode_error(error_message,cap,@"cannot build DFlash2 bonus distribution");return 1;}next=q38_mtp_sample_distribution(&p,rng_state);}else{if(r->prefill_mma_level!=0){st=rollback_to_accept(model,emit,error_message,cap);if(st)return st;}else{gdn_state_copy(r,1);st=model_forward_batch(model,tokens,emit,j,0,error_message,cap);if(st)return st;target=r->p_logits2.contents;if(!q38_mtp_distribution_from_logits(target+(size_t)a*QWEN38_VOCAB_SIZE,QWEN38_VOCAB_SIZE,temperature,top_k,top_p,&rejection)){decode_error(error_message,cap,@"cannot rebuild DFlash2 rejection distribution");return 1;}}next=q38_mtp_sample_residual(&rejection,&qrows[a],rng_state);}
+    for(uint32_t i=0;i<emit;++i)emitted[i]=tokens[i];*emitted_count=emit;*accepted=(int)a;*current_token=next;*position=j+emit;
+    if(getenv("QWEN38_DFLASH_DEBUG")!=NULL)fprintf(stderr,"[dflash2] depth %u accepted %u%s step %.1f ms next %u\n",depth,a,a==depth?" full":" reject",(decode_seconds()-tic)*1000.0,next);
+    return 0;
 }

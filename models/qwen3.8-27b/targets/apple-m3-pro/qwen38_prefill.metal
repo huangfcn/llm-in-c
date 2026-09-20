@@ -3422,3 +3422,291 @@ kernel void qwen38_prefill_mtp_fuse(
                  inv_rms_hidden * hidden_norm[index]);
     }
 }
+
+/* -------------------------------------------------------------------------
+ * DFlash2 draft model for Qwen3.8-27B.
+ *
+ * The published drafter is 5120-wide with 32 Q heads, 8 KV heads, 128-dim
+ * heads, a 2048 sliding window, non-causal proposal-block attention, two-tap
+ * grouped dynamic convolutions, and a 256-rank candidate selector.  These
+ * kernels intentionally use the existing kBatch function constant so the
+ * host can reuse the S1..S8 prefill pipeline buckets.
+ * ------------------------------------------------------------------------- */
+constant uint kDFlashHidden = 5120;
+constant uint kDFlashHeads = 32;
+constant uint kDFlashKVHeads = 8;
+constant uint kDFlashHeadDim = 128;
+constant uint kDFlashQWidth = 4096;
+constant uint kDFlashKVWidth = 1024;
+constant uint kDFlashWindow = 2047; /* RotatingKVCache max_size = sliding_window - 1. */
+constant uint kDFlashGroups = 320;  /* 5120 / 16 */
+constant uint kDFlashConvProj = 1280; /* 2 sides x 2 taps x 320 groups */
+constant float kDFlashRopeTheta = 10000000.0f;
+constant float kDFlashRmsEps = 1.0e-6f;
+
+struct DFlashCaptureParams {
+    uint start_position;
+    uint tap_slot;
+};
+struct DFlashGatherParams {
+    uint start_position;
+    uint rows;
+};
+struct DFlashContextParams {
+    uint start_position;
+    uint rows;
+};
+struct DFlashAttentionParams {
+    uint proposal_position;
+    uint context_count;
+    uint proposal_rows;
+    uint reserved;
+};
+
+kernel void qwen38_dflash_capture_target(
+    device const float *input [[buffer(0)]],
+    device half *ring [[buffer(1)]],
+    device uint *tags [[buffer(2)]],
+    constant DFlashCaptureParams &p [[buffer(3)]],
+    uint2 pos [[thread_position_in_grid]]) {
+    uint d = pos.x, s = pos.y;
+    if (d >= kDFlashHidden || s >= kBatch) return;
+    uint phys = (p.start_position + s) & 2047u;
+    ring[((phys * 5u + p.tap_slot) * kDFlashHidden) + d] =
+        half(input[s * kDFlashHidden + d]);
+    if (d == 0u && p.tap_slot == 4u) tags[phys] = p.start_position + s + 1u;
+}
+
+kernel void qwen38_dflash_gather_target(
+    device const half *ring [[buffer(0)]],
+    device half *output [[buffer(1)]],
+    constant DFlashGatherParams &p [[buffer(2)]],
+    uint2 pos [[thread_position_in_grid]]) {
+    uint d = pos.x, s = pos.y;
+    if (d >= 5u * kDFlashHidden || s >= p.rows || s >= kBatch) return;
+    uint phys = (p.start_position + s) & 2047u;
+    uint tap = d / kDFlashHidden;
+    uint within = d - tap * kDFlashHidden;
+    output[s * (5u * kDFlashHidden) + d] =
+        ring[((phys * 5u + tap) * kDFlashHidden) + within];
+}
+
+kernel void qwen38_dflash_rms_f16(
+    device const half *input [[buffer(0)]],
+    device const half *weight [[buffer(1)]],
+    device half *output [[buffer(2)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint3 gid [[threadgroup_position_in_grid]]) {
+    threadgroup float part[256];
+    uint s = gid.x;
+    float sum = 0.0f;
+    for (uint d = tid; d < kDFlashHidden; d += 256) {
+        float x = float(input[s * kDFlashHidden + d]); sum += x*x;
+    }
+    part[tid] = sum; threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride=128; stride; stride>>=1) {
+        if (tid < stride) part[tid] += part[tid+stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv = rsqrt(part[0] / float(kDFlashHidden) + kDFlashRmsEps);
+    for (uint d = tid; d < kDFlashHidden; d += 256)
+        output[s*kDFlashHidden+d] = half(float(input[s*kDFlashHidden+d]) * inv * float(weight[d]));
+}
+
+kernel void qwen38_dflash_rms_f32(
+    device const float *input [[buffer(0)]],
+    device const half *weight [[buffer(1)]],
+    device half *output [[buffer(2)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint3 gid [[threadgroup_position_in_grid]]) {
+    threadgroup float part[256];
+    uint s=gid.x; float sum=0.0f;
+    for (uint d=tid; d<kDFlashHidden; d+=256) { float x=input[s*kDFlashHidden+d]; sum+=x*x; }
+    part[tid]=sum; threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride=128; stride; stride>>=1) { if(tid<stride) part[tid]+=part[tid+stride]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+    float inv=rsqrt(part[0]/float(kDFlashHidden)+kDFlashRmsEps);
+    for(uint d=tid; d<kDFlashHidden; d+=256) output[s*kDFlashHidden+d]=half(input[s*kDFlashHidden+d]*inv*float(weight[d]));
+}
+
+/* Small FP16 row-major matrix multiply used by the dynamic-conv projection
+ * and selector projection.  Large backbone matrices stay on Q4G64. */
+kernel void qwen38_dflash_f16_gemm(
+    device const half *x [[buffer(0)]],
+    device const half *w [[buffer(1)]],
+    device float *out [[buffer(2)]],
+    constant PrefillGemmParams &p [[buffer(3)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint sgs [[simdgroups_per_threadgroup]],
+    uint3 gid [[threadgroup_position_in_grid]]) {
+    uint row=gid.x*sgs+sg; if(row>=p.rows) return;
+    uint cols=p.groups_per_row; /* here this field means literal columns */
+    for(uint s=0;s<kBatch;++s) {
+        float partial=0.0f;
+        for(uint c=lane;c<cols;c+=32) partial += float(x[s*cols+c])*float(w[row*cols+c]);
+        float sum=simd_sum(partial);
+        if(lane==0) out[s*p.rows+row]=sum;
+    }
+}
+
+kernel void qwen38_dflash_dynamic_prepare(
+    device const half *hidden [[buffer(0)]],
+    device const float *dynamic [[buffer(1)]],
+    device const half *base [[buffer(2)]],
+    device half *output [[buffer(3)]],
+    uint2 pos [[thread_position_in_grid]]) {
+    uint c=pos.x,s=pos.y; if(c>=kDFlashHidden||s>=kBatch) return;
+    uint g=c>>4; float y=0.0f;
+    for(uint tap=0;tap<2;++tap) {
+        if(s<tap) continue;
+        float coeff=float(base[tap*kDFlashHidden+c]) + dynamic[s*kDFlashConvProj + tap*kDFlashGroups + g];
+        y += coeff * float(hidden[(s-tap)*kDFlashHidden+c]);
+    }
+    output[s*kDFlashHidden+c]=half(y);
+}
+
+kernel void qwen38_dflash_dynamic_finish(
+    device const float *hidden [[buffer(0)]],
+    device const float *dynamic [[buffer(1)]],
+    device const half *base [[buffer(2)]],
+    device float *output [[buffer(3)]],
+    uint2 pos [[thread_position_in_grid]]) {
+    uint c=pos.x,s=pos.y; if(c>=kDFlashHidden||s>=kBatch) return;
+    uint g=c>>4; float y=0.0f;
+    for(uint tap=0;tap<2;++tap) {
+        if(s<tap) continue;
+        float coeff=float(base[(2u+tap)*kDFlashHidden+c]) + dynamic[s*kDFlashConvProj + (2u+tap)*kDFlashGroups + g];
+        y += coeff * hidden[(s-tap)*kDFlashHidden+c];
+    }
+    output[s*kDFlashHidden+c]=y;
+}
+
+kernel void qwen38_dflash_add_residual(
+    device const float *delta [[buffer(0)]],
+    device const float *residual [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    uint2 pos [[thread_position_in_grid]]) {
+    uint d=pos.x,s=pos.y; if(d>=kDFlashHidden||s>=kBatch)return;
+    uint i=s*kDFlashHidden+d; output[i]=residual[i]+delta[i];
+}
+
+kernel void qwen38_dflash_copy_float(
+    device const float *input [[buffer(0)]],
+    device float *output [[buffer(1)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x < kDFlashHidden && gid.y < kBatch)
+        output[gid.y * kDFlashHidden + gid.x] =
+            input[gid.y * kDFlashHidden + gid.x];
+}
+
+kernel void qwen38_dflash_half_to_float(
+    device const half *input [[buffer(0)]], device float *output [[buffer(1)]],
+    uint2 pos [[thread_position_in_grid]]) {
+    uint d=pos.x,s=pos.y; if(d>=kDFlashHidden||s>=kBatch)return;
+    output[s*kDFlashHidden+d]=float(input[s*kDFlashHidden+d]);
+}
+
+kernel void qwen38_dflash_float_to_half_width(
+    device const float *input [[buffer(0)]], device half *output [[buffer(1)]],
+    constant uint &width [[buffer(2)]], uint2 pos [[thread_position_in_grid]]) {
+    uint d=pos.x,s=pos.y; if(d>=width||s>=kBatch)return;
+    output[s*width+d]=half(input[s*width+d]);
+}
+
+inline float dflash_rope(threadgroup const float *v,uint d,uint pos) {
+    uint f=d&63u; float exponent=-2.0f*float(f)/128.0f;
+    float a=float(pos)*pow(kDFlashRopeTheta,exponent), c=cos(a), ss=sin(a);
+    return d<64 ? v[d]*c-v[d+64]*ss : v[d]*c+v[d-64]*ss;
+}
+
+kernel void qwen38_dflash_prepare_q(
+    device const float *projected [[buffer(0)]], device const half *norm [[buffer(1)]],
+    constant DFlashAttentionParams &p [[buffer(2)]], device float *q [[buffer(3)]],
+    uint tid [[thread_index_in_threadgroup]], uint3 gid [[threadgroup_position_in_grid]]) {
+    threadgroup float vals[128]; threadgroup float sq[128];
+    uint head=gid.x,s=gid.y; if(head>=kDFlashHeads||s>=kBatch)return;
+    float x=projected[s*kDFlashQWidth+head*kDFlashHeadDim+tid]; vals[tid]=x; sq[tid]=x*x;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for(uint st=64;st;st>>=1){if(tid<st)sq[tid]+=sq[tid+st];threadgroup_barrier(mem_flags::mem_threadgroup);}
+    vals[tid]=x*rsqrt(sq[0]/128.0f+kDFlashRmsEps)*float(norm[tid]); threadgroup_barrier(mem_flags::mem_threadgroup);
+    q[s*kDFlashQWidth+head*kDFlashHeadDim+tid]=dflash_rope(vals,tid,p.proposal_position+s);
+}
+
+kernel void qwen38_dflash_prepare_prop_k(
+    device const float *projected [[buffer(0)]], device const half *norm [[buffer(1)]],
+    constant DFlashAttentionParams &p [[buffer(2)]], device half *key [[buffer(3)]],
+    uint tid [[thread_index_in_threadgroup]], uint3 gid [[threadgroup_position_in_grid]]) {
+    threadgroup float vals[128]; threadgroup float sq[128];
+    uint head=gid.x,s=gid.y; if(head>=kDFlashKVHeads||s>=kBatch)return;
+    float x=projected[s*kDFlashKVWidth+head*kDFlashHeadDim+tid];vals[tid]=x;sq[tid]=x*x;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for(uint st=64;st;st>>=1){if(tid<st)sq[tid]+=sq[tid+st];threadgroup_barrier(mem_flags::mem_threadgroup);}
+    vals[tid]=x*rsqrt(sq[0]/128.0f+kDFlashRmsEps)*float(norm[tid]);threadgroup_barrier(mem_flags::mem_threadgroup);
+    key[s*kDFlashKVWidth+head*kDFlashHeadDim+tid]=half(dflash_rope(vals,tid,p.proposal_position+s));
+}
+
+kernel void qwen38_dflash_prepare_context_k(
+    device const float *projected [[buffer(0)]], device const half *norm [[buffer(1)]],
+    constant DFlashContextParams &p [[buffer(2)]], device half *cache [[buffer(3)]],
+    uint tid [[thread_index_in_threadgroup]], uint3 gid [[threadgroup_position_in_grid]]) {
+    threadgroup float vals[128]; threadgroup float sq[128];
+    uint head=gid.x,s=gid.y; if(head>=kDFlashKVHeads||s>=p.rows||s>=kBatch)return;
+    float x=projected[s*kDFlashKVWidth+head*kDFlashHeadDim+tid];vals[tid]=x;sq[tid]=x*x;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for(uint st=64;st;st>>=1){if(tid<st)sq[tid]+=sq[tid+st];threadgroup_barrier(mem_flags::mem_threadgroup);}
+    vals[tid]=x*rsqrt(sq[0]/128.0f+kDFlashRmsEps)*float(norm[tid]);threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint abs=p.start_position+s, phys=abs%kDFlashWindow;
+    cache[(phys*kDFlashKVHeads+head)*kDFlashHeadDim+tid]=half(dflash_rope(vals,tid,abs));
+}
+
+kernel void qwen38_dflash_store_context_v(
+    device const float *projected [[buffer(0)]], constant DFlashContextParams &p [[buffer(1)]],
+    device half *cache [[buffer(2)]], uint2 pos [[thread_position_in_grid]]) {
+    uint d=pos.x,s=pos.y; if(d>=kDFlashKVWidth||s>=p.rows||s>=kBatch)return;
+    uint phys=(p.start_position+s)%kDFlashWindow; cache[phys*kDFlashKVWidth+d]=half(projected[s*kDFlashKVWidth+d]);
+}
+
+kernel void qwen38_dflash_scores(
+    device const float *q [[buffer(0)]], device const half *ctx_k [[buffer(1)]],
+    device const half *prop_k [[buffer(2)]], constant DFlashAttentionParams &p [[buffer(3)]],
+    device float *scores [[buffer(4)]], uint tid [[thread_index_in_threadgroup]],
+    uint3 gid [[threadgroup_position_in_grid]]) {
+    uint flat=gid.y; uint s=flat/kDFlashHeads, qh=flat-s*kDFlashHeads;
+    uint total=p.context_count+p.proposal_rows, kvh=qh/4u;
+    for(uint j=tid;j<total;j+=256) {
+        float dotv=0.0f; device const float *qq=q+(s*kDFlashHeads+qh)*kDFlashHeadDim;
+        if(j<p.context_count) {
+            /* Match upstream sliding-window semantics exactly. Proposal row s
+             * is at logical offset context_count+s, so later proposal rows
+             * drop the corresponding number of oldest context positions. */
+            if (p.context_count + s - j >= 2048u) {
+                scores[(flat*(kDFlashWindow+8u))+j] = -INFINITY;
+                continue;
+            }
+            uint start=p.proposal_position-p.context_count, abs=start+j, phys=abs%kDFlashWindow;
+            device const half *kk=ctx_k+(phys*kDFlashKVHeads+kvh)*kDFlashHeadDim;
+            for(uint d=0;d<kDFlashHeadDim;++d) dotv += qq[d]*float(kk[d]);
+        } else {
+            uint ps=j-p.context_count; device const half *kk=prop_k+(ps*kDFlashKVHeads+kvh)*kDFlashHeadDim;
+            for(uint d=0;d<kDFlashHeadDim;++d) dotv += qq[d]*float(kk[d]);
+        }
+        scores[(flat*(kDFlashWindow+8u))+j]=dotv*(1.0f/sqrt(128.0f));
+    }
+}
+
+kernel void qwen38_dflash_value(
+    device const float *scores [[buffer(0)]], device const half *ctx_v [[buffer(1)]],
+    device const half *prop_v [[buffer(2)]], constant DFlashAttentionParams &p [[buffer(3)]],
+    device float *output [[buffer(4)]], uint tid [[thread_index_in_threadgroup]],
+    uint3 gid [[threadgroup_position_in_grid]]) {
+    threadgroup float red[128];
+    uint flat=gid.x, s=flat/kDFlashHeads, qh=flat-s*kDFlashHeads, kvh=qh/4u;
+    uint total=p.context_count+p.proposal_rows; device const float *sc=scores+flat*(kDFlashWindow+8u);
+    float m=-INFINITY; for(uint j=tid;j<total;j+=128)m=max(m,sc[j]); red[tid]=m; threadgroup_barrier(mem_flags::mem_threadgroup);
+    for(uint st=64;st;st>>=1){if(tid<st)red[tid]=max(red[tid],red[tid+st]);threadgroup_barrier(mem_flags::mem_threadgroup);} m=red[0];
+    float z=0.0f; for(uint j=tid;j<total;j+=128)z+=exp(sc[j]-m);red[tid]=z;threadgroup_barrier(mem_flags::mem_threadgroup);
+    for(uint st=64;st;st>>=1){if(tid<st)red[tid]+=red[tid+st];threadgroup_barrier(mem_flags::mem_threadgroup);} z=red[0];
+    float acc=0.0f;
+    for(uint j=0;j<total;++j){float pr=exp(sc[j]-m)/z; if(j<p.context_count){uint start=p.proposal_position-p.context_count,abs=start+j,phys=abs%kDFlashWindow;acc+=pr*float(ctx_v[(phys*kDFlashKVHeads+kvh)*kDFlashHeadDim+tid]);}else{uint ps=j-p.context_count;acc+=pr*float(prop_v[(ps*kDFlashKVHeads+kvh)*kDFlashHeadDim+tid]);}}
+    output[(s*kDFlashHeads+qh)*kDFlashHeadDim+tid]=acc;
+}

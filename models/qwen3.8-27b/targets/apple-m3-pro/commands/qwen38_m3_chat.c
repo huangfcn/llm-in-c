@@ -443,6 +443,26 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr, "Model resident in %.1f s. Enter /quit to exit.\n",
             seconds_now() - start);
+    int dflash2 = 0;
+    const char *dflash_env = getenv("QWEN38_DFLASH2");
+    if (dflash_env != NULL && strcmp(dflash_env, "0") != 0) {
+        char dflash_path[1024];
+        snprintf(dflash_path, sizeof(dflash_path), "%s/dflash2.q38df2",
+                 argv[1]);
+        if (qwen38_m3_model_dflash2_open(model, dflash_path, error,
+                                         sizeof(error)) == 0) {
+            dflash2 = 1;
+            fprintf(stderr, "DFlash2 speculative decoding active "
+                            "(parallel draft + sampled p/q verify).\n");
+        } else {
+            fprintf(stderr, "DFlash2 requested but unavailable: %s\n",
+                    error);
+            qwen38_m3_model_close(model);
+            qwen38_tokenizer_close(tokenizer);
+            return 6;
+        }
+    }
+
     int mtp = 0;
     int mtp_depth = 0; /* 0 = adaptive (max 7) */
     const char *mtp_depth_env = getenv("QWEN38_MTP_DEPTH");
@@ -453,7 +473,7 @@ int main(int argc, char **argv) {
     }
 
     const char *mtp_env = getenv("QWEN38_MTP");
-    if (mtp_env == NULL || strcmp(mtp_env, "0") != 0) {
+    if (!dflash2 && (mtp_env == NULL || strcmp(mtp_env, "0") != 0)) {
         char layer_path[1024];
         char extras_path[1024];
         snprintf(layer_path, sizeof(layer_path), "%s/mtp-layer.q38att",
@@ -487,7 +507,7 @@ int main(int argc, char **argv) {
 
     const char *viterbi_env = getenv("QWEN38_MTP_VITERBI");
     int viterbi_enabled =
-        viterbi_env != NULL && strcmp(viterbi_env, "0") != 0;
+        mtp && viterbi_env != NULL && strcmp(viterbi_env, "0") != 0;
     uint32_t viterbi_beam =
         parse_u32(getenv("QWEN38_MTP_VITERBI_BEAM"), 4);
     uint32_t viterbi_depth =
@@ -829,8 +849,9 @@ int main(int argc, char **argv) {
             request.top_p >= 0.0f && request.top_p <= 1.0f &&
             request.min_p <= 0.0f &&
             request.presence_penalty == 0.0f;
-        int use_mtp = mtp && (greedy_request || sampled_mtp_request);
-        if (mtp && !greedy_request && !sampled_mtp_request)
+        int use_mtp = (mtp && greedy_request) ||
+                      ((mtp || dflash2) && sampled_mtp_request);
+        if ((mtp || dflash2) && !greedy_request && !sampled_mtp_request)
             fprintf(stderr,
                     "MTP sampling supports temperature+top-k+top-p "
                     "(min_p/presence penalty must be zero); falling back "
@@ -868,8 +889,9 @@ int main(int argc, char **argv) {
                 uint32_t step_emitted[8];
                 uint32_t step_count = 0;
                 int step_accepted = 0;
-                qwen38_m3_model_mtp_context(model, history,
-                                            history_count);
+                if (mtp)
+                    qwen38_m3_model_mtp_context(model, history,
+                                                history_count);
 
                 int use_viterbi_now = 0;
                 float confidence_gap = 3.402823466e+38F;
@@ -940,11 +962,19 @@ int main(int argc, char **argv) {
                             trigger_run ? " run" : "");
                     }
                 } else if (sampled_mtp_request) {
-                    mtp_status = qwen38_m3_model_mtp_sample_step(
-                        model, &pending, &mtp_position, step_emitted,
-                        &step_count, &step_accepted, request.temperature,
-                        request.top_k, request.top_p, &sampler.state, error,
-                        sizeof(error));
+                    if (dflash2) {
+                        mtp_status = qwen38_m3_model_dflash2_sample_step(
+                            model, &pending, &mtp_position, step_emitted,
+                            &step_count, &step_accepted, request.temperature,
+                            request.top_k, request.top_p, &sampler.state,
+                            error, sizeof(error));
+                    } else {
+                        mtp_status = qwen38_m3_model_mtp_sample_step(
+                            model, &pending, &mtp_position, step_emitted,
+                            &step_count, &step_accepted, request.temperature,
+                            request.top_k, request.top_p, &sampler.state, error,
+                            sizeof(error));
+                    }
                 } else {
                     mtp_status = qwen38_m3_model_mtp_step(
                         model, &pending, &mtp_position, step_emitted,
@@ -952,7 +982,7 @@ int main(int argc, char **argv) {
                         sizeof(error));
                 }
                 if (mtp_status != 0) {
-                    fprintf(stderr, "MTP step failed: %s\n", error);
+                    fprintf(stderr, "speculative step failed: %s\n", error);
                     failed = 1;
                     break;
                 }

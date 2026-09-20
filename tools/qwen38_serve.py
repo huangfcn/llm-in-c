@@ -634,11 +634,14 @@ class Engine:
 ENGINE = None
 THINKING_DEFAULT = False
 EFFORT_DEFAULT = "medium"
-# Decode presets. "official" is the Qwen3.8 thinking-mode recommendation.
-# "mtp" keeps the historical greedy/output-lossless speculative path.
-# "viterbi" uses sampling-aware speculative MTP with temperature=1/top-k=10;
-# adaptive Viterbi then performs true depth-by-depth target-beam search at
-# selected low-confidence/repetitive positions.
+# Decode presets.  DFlash2 is the production/default path.
+#
+# dflash2:   Q4 DFlash2, block 8, sampled target policy 1.0/20/0.95.
+# mtp:       sampled MTP under the same target policy; adaptive Viterbi is
+#            always enabled internally, so there is no separate viterbi mode.
+# official:  target-only decoding (no MTP, no DFlash2); thinking defaults to
+#            high/xhigh so this is the clean quality/control path.
+# benchmark: greedy MTP (temperature=0, top-k=1) for speed benchmarking.
 OFFICIAL_SAMPLING_DEFAULTS = {
     "temperature": 1.0,
     "top_k": 20,
@@ -646,21 +649,16 @@ OFFICIAL_SAMPLING_DEFAULTS = {
     "min_p": 0.0,
     "presence_penalty": 0.0,
 }
-MTP_SAMPLING_DEFAULTS = {
+MTP_SAMPLING_DEFAULTS = dict(OFFICIAL_SAMPLING_DEFAULTS)
+DFLASH2_SAMPLING_DEFAULTS = dict(OFFICIAL_SAMPLING_DEFAULTS)
+BENCHMARK_SAMPLING_DEFAULTS = {
     "temperature": 0.0,
     "top_k": 1,
     "top_p": 0.0,
     "min_p": 0.0,
     "presence_penalty": 0.0,
 }
-VITERBI_SAMPLING_DEFAULTS = {
-    "temperature": 1.0,
-    "top_k": 10,
-    "top_p": 0.0,
-    "min_p": 0.0,
-    "presence_penalty": 0.0,
-}
-SAMPLING_DEFAULTS = dict(OFFICIAL_SAMPLING_DEFAULTS)
+SAMPLING_DEFAULTS = dict(DFLASH2_SAMPLING_DEFAULTS)
 # Per-request sampling overrides are opt-in so server defaults remain
 # authoritative unless explicitly enabled.
 ALLOW_CLIENT_SAMPLING = os.environ.get(
@@ -1233,12 +1231,14 @@ def main():
                         choices=["low", "medium", "xhigh"])
     parser.add_argument(
         "--decode-mode",
-        default=os.environ.get("QWEN38_DECODE_MODE", "official"),
-        choices=["official", "mtp", "viterbi"],
-        help=("official (default): sampled MTP + sampled Viterbi with Qwen "
-              "thinking defaults temp=1/top-k=20/top-p=0.95; mtp: fast "
-              "greedy MTP; viterbi: sampled MTP temp=1/top-k=10 plus "
-              "adaptive true target-beam Viterbi search"))
+        default=os.environ.get("QWEN38_DECODE_MODE", "dflash2"),
+        choices=["dflash2", "mtp", "official", "benchmark"],
+        help=("dflash2 (default): Q4 block-8 DFlash2 with "
+              "temp=1/top-k=20/top-p=0.95; mtp: sampled MTP with the same "
+              "sampling policy and adaptive Viterbi always enabled; "
+              "official: target-only decoding, no speculative drafter, "
+              "thinking high/xhigh; benchmark: greedy MTP "
+              "temperature=0/top-k=1"))
     # None means "take the selected decode-mode preset". Environment values
     # and explicit CLI values override the preset.
     parser.add_argument("--temperature", type=float, default=None)
@@ -1255,12 +1255,14 @@ def main():
     THINKING_DEFAULT = bool(arguments.thinking)
     EFFORT_DEFAULT = arguments.reasoning_effort
 
-    if arguments.decode_mode == "official":
-        preset = OFFICIAL_SAMPLING_DEFAULTS
-    elif arguments.decode_mode == "viterbi":
-        preset = VITERBI_SAMPLING_DEFAULTS
-    else:
+    if arguments.decode_mode == "dflash2":
+        preset = DFLASH2_SAMPLING_DEFAULTS
+    elif arguments.decode_mode == "mtp":
         preset = MTP_SAMPLING_DEFAULTS
+    elif arguments.decode_mode == "benchmark":
+        preset = BENCHMARK_SAMPLING_DEFAULTS
+    else:
+        preset = OFFICIAL_SAMPLING_DEFAULTS
 
     def resolve_float(argument_value, env_name, key):
         if argument_value is not None:
@@ -1295,8 +1297,27 @@ def main():
         "min_p": arguments.min_p,
         "presence_penalty": arguments.presence_penalty,
     })
-    if arguments.decode_mode in ("official", "viterbi"):
-        os.environ.setdefault("QWEN38_MTP_VITERBI", "1")
+    # Make decode-mode ownership explicit so stale shell environment values
+    # cannot accidentally combine MTP and DFlash2.
+    if arguments.decode_mode == "dflash2":
+        os.environ["QWEN38_DFLASH2"] = "1"
+        os.environ["QWEN38_MTP"] = "0"
+        os.environ["QWEN38_MTP_VITERBI"] = "0"
+        os.environ.setdefault("QWEN38_DFLASH_BLOCK", "8")
+    elif arguments.decode_mode == "mtp":
+        os.environ["QWEN38_DFLASH2"] = "0"
+        os.environ["QWEN38_MTP"] = "1"
+        os.environ["QWEN38_MTP_VITERBI"] = "1"
+    elif arguments.decode_mode == "benchmark":
+        os.environ["QWEN38_DFLASH2"] = "0"
+        os.environ["QWEN38_MTP"] = "1"
+        os.environ["QWEN38_MTP_VITERBI"] = "0"
+    else:  # official: target-only quality/control path
+        os.environ["QWEN38_DFLASH2"] = "0"
+        os.environ["QWEN38_MTP"] = "0"
+        os.environ["QWEN38_MTP_VITERBI"] = "0"
+        THINKING_DEFAULT = True
+        EFFORT_DEFAULT = "xhigh"
     print("decode mode: "
           f"{arguments.decode_mode}; sampling={SAMPLING_DEFAULTS}",
           flush=True)

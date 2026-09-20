@@ -179,6 +179,58 @@ int qwen38_m3_model_mtp_viterbi_sample_step(
     size_t error_message_capacity);
 
 
+/* DFlash2 parallel speculative drafter.  The draft image is produced by
+ * tools/qwen38_dflash2_pack.py from the official Qwen3.8-27B-DFlash2
+ * checkpoint.  The sampled step uses the same exact p/q acceptance and
+ * residual correction as sampled MTP, so draft quantization changes
+ * acceptance/speed but not the target sampling distribution. */
+int qwen38_m3_model_dflash2_open(
+    qwen38_m3_model *model,
+    const char *image_path,
+    char *error_message,
+    size_t error_message_capacity);
+
+/* DFlash2 diagnostic module tests. These are intended for the validation
+ * executable and do not change normal decoding.  validate checks all DFlash
+ * and target-verifier buffers/pipelines; propose runs only the parallel draft;
+ * verify runs only the target batch verifier and restores GDN state afterward. */
+int qwen38_m3_model_dflash2_test_validate(
+    qwen38_m3_model *model,
+    char *error_message,
+    size_t error_message_capacity);
+
+int qwen38_m3_model_dflash2_test_propose(
+    qwen38_m3_model *model,
+    uint32_t current_token,
+    uint32_t position,
+    uint32_t block,
+    uint32_t drafts[7],
+    uint32_t *draft_count,
+    char *error_message,
+    size_t error_message_capacity);
+
+int qwen38_m3_model_dflash2_test_verify(
+    qwen38_m3_model *model,
+    const uint32_t *tokens,
+    uint32_t batch,
+    uint32_t position,
+    char *error_message,
+    size_t error_message_capacity);
+
+int qwen38_m3_model_dflash2_sample_step(
+    qwen38_m3_model *model,
+    uint32_t *current_token,
+    uint32_t *position,
+    uint32_t emitted[8],
+    uint32_t *emitted_count,
+    int *accepted,
+    float temperature,
+    uint32_t top_k,
+    float top_p,
+    uint64_t *rng_state,
+    char *error_message,
+    size_t error_message_capacity);
+
 /* Adaptive Viterbi-style multi-path lookahead. Requires target logits from a
  * preceding MTP step. The top beam_width pending-token hypotheses are each
  * extended depth positions by the MTP draft model, target-verified, and
